@@ -1,0 +1,6 @@
+# Runtime de Spark (el JAR se descarga automáticamente vía spark.jars.packages)
+pyspark==3.5.3
+
+# Utilidades para inspeccionar los eventos OpenLineage generados
+# (opcional, pero útil para debuggear el .ndjson)
+jsonlines>=4.0.0

@@ -1,0 +1,147 @@
+version: "3.8"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Volumes
+# ─────────────────────────────────────────────────────────────────────────────
+volumes:
+  marquez_pgdata:
+  ivy_cache:
+  grafana_data:
+  nessie_data:
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Servicios
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  #  MARQUEZ  (OpenLineage backend)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  marquez-db:
+    image: postgres:14
+    container_name: marquez-db
+    environment:
+      POSTGRES_USER: marquez
+      POSTGRES_PASSWORD: marquez
+      POSTGRES_DB: marquez
+    volumes:
+      - marquez_pgdata:/var/lib/postgresql/data
+    networks:
+      default:
+        aliases:
+          - postgres        # Marquez busca exactamente este hostname
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marquez -d marquez"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  marquez:
+    image: marquezproject/marquez:0.47.0
+    container_name: marquez
+    ports:
+      - "5000:5000"         # OpenLineage HTTP + REST API
+      - "5001:5001"         # Admin / health
+    environment:
+      MARQUEZ_PORT: 5000
+      MARQUEZ_ADMIN_PORT: 5001
+      POSTGRES_USER: marquez
+      POSTGRES_PASSWORD: marquez
+    depends_on:
+      marquez-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5001/healthcheck || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+
+  marquez-web:
+    image: marquezproject/marquez-web:0.47.0
+    container_name: marquez-web
+    ports:
+      - "3000:3000"
+    environment:
+      MARQUEZ_HOST: marquez
+      MARQUEZ_PORT: 5000
+    depends_on:
+      marquez:
+        condition: service_healthy
+
+  # ════════════════════════════════════════════════════════════════════════════
+  #  NESSIE  (catálogo Iceberg con historial Git-like)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.77.1
+    container_name: nessie
+    ports:
+      - "19120:19120"       # API REST + UI en /
+    environment:
+      NESSIE_VERSION_STORE_TYPE: IN_MEMORY   # producción: JDBC o ROCKSDB
+    volumes:
+      - nessie_data:/nessie/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:19120/api/v2/config || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ════════════════════════════════════════════════════════════════════════════
+  #  GRAFANA  (observabilidad — dashboard de eventos OpenLineage)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: grafana
+    ports:
+      - "3001:3000"         # 3000 la ocupa Marquez-web
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: grafana-infinity-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./conf/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - marquez
+
+  # ════════════════════════════════════════════════════════════════════════════
+  #  SPARK  (PySpark + Hudi + Delta + Iceberg + OpenLineage)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  spark:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: spark
+    environment:
+      # ── Transporte OpenLineage (HTTP → Marquez) ────────────────────────────
+      OPENLINEAGE_URL: http://marquez:5000
+      OPENLINEAGE_NAMESPACE: poc-openlineage
+      # Autenticación (descomentar si Marquez tiene auth habilitada):
+      # OPENLINEAGE_API_KEY: "changeme-secret-key"
+      # ── Catálogo Iceberg ────────────────────────────────────────────────────
+      # Cambiar a "nessie" para usar el catálogo con historial Git-like.
+      # Opciones: "local" (hadoop) | "nessie"
+      ICEBERG_CATALOG: nessie
+      NESSIE_URI: http://nessie:19120/api/v1
+      # ── Maven cache ────────────────────────────────────────────────────────
+      IVY_CACHE: /root/.ivy2
+    volumes:
+      - ./examples:/app/examples:ro
+      - ./generate_data.py:/app/generate_data.py:ro
+      - ./inspect_lineage.py:/app/inspect_lineage.py:ro
+      - ./data:/app/data
+      - ./openlineage:/app/openlineage
+      - ivy_cache:/root/.ivy2
+    depends_on:
+      marquez:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+    command: ["tail", "-f", "/dev/null"]

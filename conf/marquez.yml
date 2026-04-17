@@ -1,0 +1,20 @@
+# Este fichero ya NO se monta en docker-compose.
+# La configuración de Marquez se pasa íntegramente via variables de entorno
+# en el servicio `marquez` del docker-compose.yml:
+#
+#   POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
+#   MARQUEZ_PORT, MARQUEZ_ADMIN_PORT
+#
+# Se conserva aquí como referencia del formato por si en el futuro
+# se quiere montar con MARQUEZ_CONFIG=/opt/marquez/marquez.yml
+
+db:
+  driverClass: org.postgresql.Driver
+  url: jdbc:postgresql://marquez-db:5432/marquez
+  user: marquez
+  password: marquez
+
+logging:
+  level: INFO
+
+migrateOnStartup: true
