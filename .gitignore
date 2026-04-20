@@ -2,6 +2,7 @@
 data/
 openlineage/data/
 openlineage/events.ndjson
+chroma_data/
 
 # Caché de Maven / Ivy (JARs descargados por spark.jars.packages)
 .ivy2/
@@ -17,3 +18,15 @@ __pycache__/
 spark-warehouse/
 derby.log
 metastore_db/
+
+# Claude/
+.claude/
+
+# Configuración local
+.env
+
+# Historial de conversaciones (puede contener queries sobre datos de producción)
+chat/
+
+# Frontend
+frontend/node_modules/

@@ -1,15 +1,15 @@
 """
 03_combined_pipeline.py
 -----------------------
-Pipeline completo: Hudi + Delta → JOIN SQL → Iceberg (sales_summary).
+Full pipeline: Hudi + Delta -> JOIN SQL -> Iceberg (sales_summary).
 
-OpenLineage registra dos inputs y un output, construyendo el grafo de linaje
-más interesante de la POC.
+OpenLineage records two inputs and one output, producing the most
+interesting lineage graph in this POC.
 
-Uso local:
+Local:
     python examples/03_combined_pipeline.py
 
-Uso Docker:
+Docker:
     docker compose run --rm spark python examples/03_combined_pipeline.py
 """
 
@@ -19,29 +19,30 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from _spark_builder import BASE_DIR, build_spark
 
-HUDI_ORDERS      = os.path.join(BASE_DIR, "data", "hudi", "orders")
-DELTA_CUSTOMERS  = os.path.join(BASE_DIR, "data", "delta", "customers")
-APP_NAME         = "combined_pipeline_sales_summary"
+HUDI_ORDERS = os.path.join(BASE_DIR, "data", "hudi", "orders")
+DELTA_CUSTOMERS = os.path.join(BASE_DIR, "data", "delta", "customers")
+APP_NAME = "combined_pipeline_sales_summary"
 
 
 def main() -> None:
     spark = build_spark(APP_NAME)
     spark.sparkContext.setLogLevel("WARN")
 
-    # ── 1. Leer fuentes ────────────────────────────────────────────────────────
-    print(f"[1/4] Leyendo tabla Hudi  → {HUDI_ORDERS}")
+    # 1. Read sources
+    print(f"[1/4] Reading Hudi table  -> {HUDI_ORDERS}")
     orders = spark.read.format("hudi").load(HUDI_ORDERS)
     orders.createOrReplaceTempView("orders")
-    print(f"      {orders.count()} pedidos")
+    print(f"      {orders.count()} orders")
 
-    print(f"[2/4] Leyendo tabla Delta → {DELTA_CUSTOMERS}")
+    print(f"[2/4] Reading Delta table -> {DELTA_CUSTOMERS}")
     customers = spark.read.format("delta").load(DELTA_CUSTOMERS)
     customers.createOrReplaceTempView("customers")
-    print(f"      {customers.count()} clientes")
+    print(f"      {customers.count()} customers")
 
-    # ── 2. SQL JOIN + agregación ───────────────────────────────────────────────
-    print("[3/4] Ejecutando SQL de join y agregación...")
-    result = spark.sql("""
+    # 2. JOIN + aggregation SQL
+    print("[3/4] Running join and aggregation SQL...")
+    result = spark.sql(
+        """
         SELECT
             c.customer_id,
             c.name                                          AS customer_name,
@@ -66,12 +67,13 @@ def main() -> None:
         LEFT JOIN orders o USING (customer_id)
         GROUP BY c.customer_id, c.name, c.country
         ORDER BY total_revenue DESC NULLS LAST
-    """)
+    """
+    )
     result.show(10, truncate=False)
-    print(f"      {result.count()} filas en el resultado")
+    print(f"      {result.count()} rows in result")
 
-    # ── 3. Escribir en Iceberg ─────────────────────────────────────────────────
-    print("[4/4] Escribiendo tabla Iceberg → local.poc.sales_summary")
+    # 3. Write to Iceberg
+    print("[4/4] Writing Iceberg table -> local.poc.sales_summary")
     (
         result.writeTo("local.poc.sales_summary")
         .tableProperty("write.format.default", "parquet")
@@ -79,12 +81,7 @@ def main() -> None:
         .createOrReplace()
     )
 
-    print("[OK] Listo.")
-    print("\nLinaje registrado:")
-    print(f"  data/hudi/orders        ──┐")
-    print(f"                             ├──► openlineage/data/iceberg/poc/sales_summary")
-    print(f"  data/delta/customers    ──┘")
-
+    print("[OK] Done.")
     spark.stop()
 
 

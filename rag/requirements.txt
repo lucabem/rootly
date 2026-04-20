@@ -1,0 +1,7 @@
+# RAG sobre linaje de datos
+chromadb>=0.5.0
+networkx>=3.0
+anthropic>=0.40.0
+watchdog>=4.0.0
+python-dotenv>=1.0.0
+boto3>=1.34.0

@@ -1,0 +1,118 @@
+name: Lineage Impact Check
+
+on:
+  pull_request:
+    paths:
+      - 'glue/code/jobs/**/*.py'
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  impact:
+    name: Downstream impact analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed Glue jobs
+        id: changed
+        run: |
+          # Get .py files changed in this PR under glue/code/jobs/
+          FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
+            | grep '^glue/code/jobs/.*\.py$' || true)
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Run impact analysis
+        id: impact
+        if: steps.changed.outputs.files != ''
+        env:
+          LINEAGE_API_URL: ${{ secrets.LINEAGE_API_URL }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, json, urllib.request, urllib.error, sys
+
+          api_url = os.environ["LINEAGE_API_URL"].rstrip("/")
+          raw_files = """${{ steps.changed.outputs.files }}""".strip()
+          if not raw_files:
+              print("No Glue jobs changed.")
+              sys.exit(0)
+
+          job_names = [
+              os.path.basename(f).removesuffix(".py")
+              for f in raw_files.splitlines()
+              if f.strip()
+          ]
+
+          sections = []
+          for job in job_names:
+              question = (
+                  f"¿Qué datasets y jobs downstream se verían afectados si el job '{job}' "
+                  f"cambia su lógica o schema de salida? Lista los impactos por nivel."
+              )
+              payload = json.dumps({"question": question, "n": 15}).encode()
+              req = urllib.request.Request(
+                  f"{api_url}/api/chat",
+                  data=payload,
+                  headers={"Content-Type": "application/json"},
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      answer = json.loads(resp.read())["answer"]
+              except urllib.error.URLError as e:
+                  answer = f"⚠️ No se pudo contactar con la API de linaje: {e}"
+
+              sections.append(f"### `{job}.py`\n\n{answer}")
+
+          body = "\n\n---\n\n".join(sections)
+          comment = f"""## 🔍 Análisis de impacto de linaje
+
+          Los siguientes jobs Glue han cambiado en este PR. Se muestra el impacto downstream según el grafo de linaje actual.
+
+          {body}
+
+          ---
+          <sub>Generado por [RAG Lineage](../actions) · API: `{api_url}`</sub>
+          """
+
+          # Write to file so the next step can read it without shell escaping issues
+          with open("/tmp/pr_comment.txt", "w") as f:
+              f.write(comment)
+          PYEOF
+
+      - name: Post PR comment
+        if: steps.changed.outputs.files != '' && steps.impact.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('/tmp/pr_comment.txt', 'utf8');
+
+            // Delete previous lineage bot comment if exists
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            for (const c of comments.data) {
+              if (c.body.includes('Análisis de impacto de linaje')) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: c.id,
+                });
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
