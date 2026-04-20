@@ -95,10 +95,6 @@ Si no es claro, responde como GENERAL.
 ### CONSULTA ATHENA
 - Genera una query SQL válida para Amazon Athena basándote en la pregunta del usuario y el schema disponible en el contexto.
 - Usa el nombre de tabla y columnas exactamente como aparecen en el schema del contexto.
-- Aplica los siguientes filtros de origen según la fuente mencionada en la pregunta:
-  - "siebel" → WHERE des_origen = 'SBL'
-  - "delta mayorista" → WHERE des_origen = 'ESN'
-  - "delta minorista" → WHERE des_origen = 'VTY'
 - Si se mencionan varias fuentes, combínalas con OR o con UNION según corresponda.
 - Si la pregunta pide un conteo (ej: "cuántos contratos"), usa COUNT(*) o COUNT(DISTINCT <campo_clave>).
 - Añade siempre un comentario SQL encima de la query explicando qué hace.
