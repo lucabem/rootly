@@ -1,5 +1,7 @@
 # Rootly — RAG Lineage Assistant
 
+![Rootly](image/rootly.jpeg)
+
 Sistema de linaje de datos con RAG + Claude. Los jobs de Spark (Shopflow) emiten
 eventos OpenLineage a `openlineage/events.ndjson`, que el módulo RAG indexa en
 ChromaDB para responder preguntas en lenguaje natural.
