@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # Rootly — RAG Lineage Assistant
 
 Sistema de linaje de datos con RAG + Claude. Permite consultar en lenguaje natural qué datasets existen, qué jobs los producen/consumen, su schema, impacto de cambios y código fuente de jobs Glue.
@@ -20,23 +24,47 @@ S3_JOBS_PREFIX     # default: "code/glue/jobs/AEMET/"
 REDIS_URL          # default: "redis://redis:6379/0"
 ```
 
+## Comandos
+
+```bash
+# Arrancar todo (backend + celery + redis + frontend)
+docker compose up --build
+
+# Solo el backend en local (sin Docker)
+uvicorn backend.main:app --reload
+
+# Celery worker en local
+celery -A backend.tasks worker --loglevel=info --concurrency=1
+
+# RAG desde CLI
+python -m rag.query ask "¿Qué jobs producen el dataset contratos?"
+python -m rag.query sync
+python -m rag.query impact orders
+```
+
 ## Estructura de ficheros
 
 ```
 rag/
   ingest.py      # carga eventos S3/local, construye grafo NetworkX
   vectorize.py   # serializa grafo → ChromaDB
-  query.py       # pipeline RAG completo + agentic loop
+  query.py       # pipeline RAG completo + agentic loop + sync()
   knowledge.py   # carga docs de negocio (.md, .xlsx) → chunks
-  watcher.py     # modo near real-time (watchdog local / S3 polling)
+  tools/
+    __init__.py  # TOOLS list + execute_tool_call dispatcher
+    job.py       # herramienta get_job_code
+    dataset.py   # herramientas get_dataset_schema, search_by_field,
+                 #   get_downstream_impact, find_jobs_by_dataset
 backend/
-  main.py        # FastAPI endpoints
-  tasks.py       # Celery task para sync asíncrono
+  main.py        # FastAPI endpoints + _ensure_loaded + _state
+  tasks.py       # Celery task run_sync_task
 frontend/
   src/components/GraphView.tsx   # visualización del grafo
-chroma_data/     # ChromaDB persistido (volumen Docker)
+chroma_data/     # ChromaDB persistido (volumen Docker → rag/.chroma)
 chat/            # historial de conversaciones en .md por día
 knowledge/       # documentos de negocio indexables (.md, .xlsx)
+openlineage/     # eventos OpenLineage locales (events.ndjson)
+examples/        # datos de ejemplo para modo local
 ```
 
 ## Flujo de datos
@@ -45,7 +73,7 @@ knowledge/       # documentos de negocio indexables (.md, .xlsx)
 S3 events (.ndjson)
       ↓ ingest.py: load_events_s3()
 NetworkX DiGraph (nodes: dataset | job)
-      ↓ ingest.py: enrich_graph_with_code()  ← solo en sync completo, NO en startup
+      ↓ ingest.py: enrich_graph_with_code()  ← solo en sync(), NUNCA en startup
       ↓ vectorize.py: build_index()
 ChromaDB "lineage" collection
       ↓ query.py: ask()
@@ -55,11 +83,20 @@ Claude Sonnet → respuesta
 ## Startup del backend (`main.py: _ensure_loaded`)
 
 1. Carga eventos desde disco local (`openlineage/events.ndjson`)
-2. Construye el grafo sin código de jobs (startup rápido, lazy load)
+2. Construye el grafo **sin código de jobs** (startup rápido, lazy load)
 3. Si ChromaDB ya tiene datos → reutiliza el índice persistido (NO llama `build_index`)
-4. Si ChromaDB está vacío → descarga job code de S3 + enriquece grafo + construye índice
+4. Si ChromaDB está vacío → avisa en logs. Hay que ejecutar `/api/sync`
 
-**El código de jobs NO se descarga en startup para no bloquear.** Se descarga on-demand via tool use cuando Claude lo necesita.
+**El código de jobs NUNCA se descarga en startup.** Se descarga on-demand via tool use cuando Claude llama `get_job_code`, o en bloque durante `sync()`.
+
+### Recarga post-sync
+
+Cuando una tarea Celery termina con `SUCCESS`, el endpoint `/api/task/{id}` compara:
+- `completed_at` (timestamp en el resultado de la tarea) vs `_state["loaded_at"]` (cuándo se cargó el estado)
+- Si `loaded_at >= completed_at` → estado ya está al día, **no recarga**
+- Si `loaded_at < completed_at` → el sync tiene datos más nuevos, **resetea y recarga**
+
+Esto evita recargas innecesarias cuando el frontend reabre Chrome con tareas antiguas en `localStorage`.
 
 ## Pipeline RAG — `query.py: ask()`
 
@@ -68,32 +105,34 @@ Parámetros relevantes: `question`, `collection`, `n_results=20`, `history`, `G`
 ### Pasos en orden
 
 1. **`_is_list_query`** — si la pregunta es de inventario ("listar", "todos"...) aumenta `n_results` a 40
-2. **`_rewrite_query`** — llama a Haiku para reescribir la pregunta como query semántica óptima (sinónimos, términos técnicos ETL). Combina con contexto histórico reciente
-3. **`_graph_context`** — busca en el grafo NetworkX el nodo mencionado por nombre (match substring, prioriza el más largo). Serializa el subgrafo: inputs/outputs, schema, SQL, estadísticas de ejecución. Si hay `glue_code` y es code query → incluye código; si no → añade `"Código fuente disponible: xxx.py"` como señal para la tool
+2. **`_rewrite_query`** — llama a Haiku para reescribir la pregunta como query semántica óptima. Combina con contexto histórico reciente
+3. **`_graph_context`** — busca en el grafo NetworkX el nodo mencionado por nombre (match substring, prioriza el más largo). Serializa subgrafo: inputs/outputs, schema, SQL, estadísticas. Si hay `glue_code` y es code query → incluye código; si no → añade `"Código fuente disponible: xxx.py"` como señal para la tool
 4. **ChromaDB query** — recupera `n_results * 2` candidatos con embedding semántico
 5. **Filtros exactos** — si detectó dataset/namespace concreto, los prioriza al principio del contexto
-6. **`_rerank_docs`** — Haiku filtra y reordena los docs por relevancia (hasta top_k=8). Los docs prioritarios (match exacto) nunca se reordenan
+6. **`_rerank_docs`** — Haiku filtra y reordena los docs por relevancia (hasta top_k=8). Los docs prioritarios nunca se reordenan
 7. **Agentic loop** (hasta 4 iteraciones):
    - Claude recibe contexto + tools disponibles
-   - Si `stop_reason == "tool_use"` → ejecuta `_execute_tool_call` → devuelve resultado → siguiente iteración
+   - Si `stop_reason == "tool_use"` → ejecuta `execute_tool_call` → devuelve resultado → siguiente iteración
    - Si `stop_reason == "end_turn"` → respuesta final
 
 ### Tools disponibles (agentic loop)
 
-**`get_job_code(job_name)`**
-- Busca primero en el grafo en memoria (nodo con `glue_code`)
-- Si no está → `fetch_single_job_code_s3(bucket, jobs_prefix, job_name)`: lista S3, busca por nombre exacto / sufijo / fuzzy (threshold 0.75), descarga el `.py`
-- Cachea en el nodo del grafo para no volver a S3 en la misma sesión
+Definidas en `rag/tools/`, registradas en `TOOLS` y despachadas por `execute_tool_call`.
 
-**`get_dataset_schema(dataset_name, namespace?)`**
-- Busca en el grafo por nombre (substring) + namespace opcional
-- Devuelve schema (columnas+tipos) + linaje de columnas
+| Tool | Cuándo se usa |
+|---|---|
+| `get_job_code(job_name)` | Contexto contiene `"Código fuente disponible: xxx.py"`. Busca en grafo → S3 → cachea en nodo |
+| `get_dataset_schema(dataset_name, namespace?)` | Preguntas por columnas/estructura sin schema en contexto |
+| `search_by_field(field_name)` | "¿Dónde está la columna X?" — más fiable que embedding para nombres de columna |
+| `get_downstream_impact(dataset_name)` | "¿Qué se rompe si cambio X?" — recorre el grafo hacia downstream |
+| `find_jobs_by_dataset(dataset_name)` | "¿Quién produce/consume X?" |
 
 ### Detección de filtros — `_detect_filters`
 
 Descarga todos los metadatos de ChromaDB y compara contra la pregunta por:
 1. Substring exacto (`"contratos" in question`)
 2. Tokens (`re.split(r"[\s_\-/]+")`) — captura referencias parciales
+
 Prioriza términos más largos (más específicos). Devuelve `(namespace, dataset_name)`.
 
 ## `ingest.py` — construcción del grafo
@@ -118,14 +157,9 @@ Prioriza términos más largos (más específicos). Devuelve `(namespace, datase
 
 Carga ficheros `.md` y `.xlsx` del directorio `knowledge/`. Los `.md` se parten por secciones `##`. Los `.xlsx` se parten por sheet y bloques de 60 filas. Se indexan en ChromaDB con `kind="knowledge"`.
 
-## `watcher.py` — near real-time
-
-- **`start_watching`**: watchdog sobre `events.ndjson` local. Re-indexa en cada modificación (incremental: solo lee líneas nuevas)
-- **`start_watching_s3`**: polling cada 30s comparando ETags de objetos S3. Re-indexa si hay cambios
-
 ## Sync asíncrono — `backend/tasks.py`
 
-Celery task `run_sync_task`: llama a `rag.query.sync()` en background. El endpoint `/api/sync` lo dispara y devuelve `task_id`. El frontend puede hacer polling a `/api/task/{task_id}` para ver el estado. Cuando termina (`SUCCESS`), el backend resetea `_state` y recarga el grafo.
+Celery task `run_sync_task`: llama a `rag.query.sync()` en background. El endpoint `/api/sync` lo dispara y devuelve `task_id`. El resultado incluye `completed_at: time.time()` para que el backend pueda compararlo con `_state["loaded_at"]` y decidir si recargar.
 
 ## Endpoints API relevantes
 
@@ -133,7 +167,7 @@ Celery task `run_sync_task`: llama a `rag.query.sync()` en background. El endpoi
 |---|---|
 | `POST /api/chat` | Pregunta RAG. Recibe `question`, `history[]`, `n` |
 | `POST /api/sync` | Lanza sync asíncrono desde S3 |
-| `GET /api/task/{id}` | Estado de la tarea Celery |
+| `GET /api/task/{id}` | Estado de la tarea Celery; dispara recarga si procede |
 | `GET /api/datasets` | Lista todos los datasets del grafo |
 | `POST /api/impact` | Análisis de impacto downstream |
 | `GET /api/graph` | Todos los nodos y edges del grafo |
@@ -142,8 +176,9 @@ Celery task `run_sync_task`: llama a `rag.query.sync()` en background. El endpoi
 
 ## Decisiones de diseño importantes
 
-- **Lazy load de código**: el código `.py` de jobs NO se descarga al arrancar. Solo cuando Claude llama la tool `get_job_code`. Esto evita descargar cientos de ficheros innecesarios
+- **Lazy load de código**: el código `.py` de jobs NO se descarga al arrancar. Solo cuando Claude llama `get_job_code` o en sync completo. Evita descargar cientos de ficheros innecesarios
 - **Graph lookup primero**: antes de buscar en ChromaDB, se hace lookup directo en el grafo NetworkX. Más preciso para preguntas con nombre específico
-- **Reranking con Haiku**: se recuperan el doble de docs necesarios y Haiku filtra. Así el recall del embedding no limita la calidad final
+- **Reranking con Haiku**: se recuperan el doble de docs necesarios y Haiku filtra. El recall del embedding no limita la calidad final
 - **Cache en prompt**: `SYSTEM_PROMPT` y el contexto de linaje usan `cache_control: ephemeral` para prompt caching de Anthropic
 - **Match exacto en GraphView**: los filtros de dataset/job en el frontend usan `===` (no `includes`) para evitar falsos positivos (ej: "contratos" no debe mostrar "contratos_viejo")
+- **`_state` en FastAPI**: el grafo y la colección viven en `_state` (dict global en `main.py`). `_state["loaded_at"]` es un `float` Unix timestamp que controla si un sync posterior necesita recargar

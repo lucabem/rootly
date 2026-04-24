@@ -43,6 +43,8 @@ from rag.ingest import (
     load_job_code_s3,
 )
 from rag.vectorize import build_index, get_collection
+from rag.tools import TOOLS as _TOOLS, execute_tool_call as _execute_tool_call
+from rag.tools.dataset import downstream_layers as _downstream_layers
 
 SYSTEM_PROMPT = """\
 Eres un asistente experto en linaje de datos para equipos de ETL y en consultas SQL sobre Amazon Athena. Respondes siempre en español, de forma concisa y estructurada.
@@ -50,7 +52,7 @@ Eres un asistente experto en linaje de datos para equipos de ETL y en consultas 
 Dispones de un contexto con:
 - Datasets
 - Pipelines (jobs) que leen/escriben
-- Transformaciones SQL
+- Transformaciones SQL dentro del .py de Glue (si está disponible)
 - Historial de ejecuciones
 - Schema
 - Linaje de columnas
@@ -104,6 +106,16 @@ Si no es claro, responde como GENERAL.
 ### GENERAL
 - Responde solo con información presente en el contexto.
 - Si el contexto no tiene información relevante, responde: "No se encontró información relevante en el índice de linaje. Ejecuta 'sync' primero."
+
+## Uso de herramientas — cuándo llamar a cada una
+
+Tienes herramientas disponibles. Úsalas de forma proactiva cuando el contexto no sea suficiente:
+
+- **`get_job_code`**: si el contexto dice `Código fuente disponible: xxx.py`, llámala automáticamente. No pidas al usuario que pregunte de nuevo.
+- **`get_dataset_schema`**: si preguntan por columnas/estructura de una tabla y no está en el contexto.
+- **`search_by_field`**: si preguntan por un campo/columna concreto ("¿dónde está X?", "¿qué tablas tienen Y?"). Más fiable que el contexto semántico para nombres de columnas.
+- **`get_downstream_impact`**: si preguntan qué se rompe o qué depende de un dataset. Devuelve el árbol exacto del grafo.
+- **`find_jobs_by_dataset`**: si preguntan quién produce o consume un dataset concreto.
 
 ## Reglas globales
 - No inventes información.
@@ -219,6 +231,28 @@ def _rerank_docs(
         return docs[:top_k]
 
 
+_CODE_KEYWORDS = {
+    "código", "codigo", "script", "implementación", "implementacion",
+    "cómo funciona", "como funciona", "qué hace", "que hace",
+    "lógica", "logica", "fuente", "python", ".py", "glue", "spark",
+    "muéstrame", "muestrame", "enséñame", "enseñame", "ver el código",
+    # lógica de campos
+    "cómo se calcula", "como se calcula", "cómo se genera", "como se genera",
+    "cómo se construye", "como se construye", "cómo se obtiene", "como se obtiene",
+    "de dónde viene", "de donde viene", "de dónde sale", "de donde sale",
+    "cómo se rellena", "como se rellena", "cómo se popula", "como se popula",
+    "qué lógica", "que logica", "qué lógica", "que lógica",
+    "lógica del campo", "logica del campo", "lógica de la columna", "logica de la columna",
+    "cómo se deriva", "como se deriva", "cómo se transforma", "como se transforma",
+    "ver", "muestra", "dame", "necesito",
+}
+
+
+def _is_code_query(question: str) -> bool:
+    q = question.lower()
+    return any(kw in q for kw in _CODE_KEYWORDS)
+
+
 def _graph_context(G: nx.DiGraph, question: str) -> str:
     """Find the job or dataset mentioned in the question and serialize its full subgraph."""
     q = question.lower()
@@ -255,8 +289,13 @@ def _graph_context(G: nx.DiGraph, question: str) -> str:
         lines.append(f"Ejecuciones: {n_ok} exitosas, {n_fail} fallidas")
         if last:
             lines.append(f"Último evento: {last['type']} en {last['ts']}")
-        if node.get("sql"):
-            lines.append(f"SQL:\n{node['sql'].strip()}")
+
+        if node.get("glue_code"):
+            if _is_code_query(question):
+                print(f"[debug] Detected code-related question, including glue code for job '{node.get('name', '?')}'")
+                lines.append(f"\nCódigo fuente ({node.get('name', '?')}.py):\n```python\n{node['glue_code'].strip()}\n```")
+            else:
+                lines.append(f"\nCódigo fuente disponible: {node.get('name', '?')}.py")
 
         lines.append(f"\nInputs ({len(inputs)}):")
         for _, ds in inputs:
@@ -300,12 +339,16 @@ def _graph_context(G: nx.DiGraph, question: str) -> str:
     return "\n".join(lines)
 
 
+
+
 def ask(
     question: str,
     collection: chromadb.Collection,
     n_results: int = 20,
     history: list[dict] | None = None,
     G: nx.DiGraph | None = None,
+    bucket: str | None = None,
+    jobs_prefix: str = "glue/code/jobs/",
 ) -> str:
     if not os.getenv("ANTHROPIC_API_KEY"):
         return "[ERROR] ANTHROPIC_API_KEY environment variable is missing."
@@ -332,6 +375,7 @@ def ask(
 
     seen_ids: set[str] = set()
     docs: list[str] = []
+    graph_doc: str = ""
 
     # 4a. Direct graph lookup - if the question mentions a specific job/dataset
     if G is not None:
@@ -386,9 +430,12 @@ def ask(
         return "No relevant information found in the lineage index. Run 'sync' first."
 
     # 5. Reranking: filter to the most relevant docs with Haiku
-    priority = docs[:1] if name and docs else []  # exact doc is always kept
-    rest = docs[len(priority):]
-    reranked_rest = _rerank_docs(question, rest, client, top_k=max(n_results - len(priority), 4))
+    # graph_doc is always kept (exact node match) - never passed through reranker
+    n_priority = 1 if graph_doc and docs and docs[0] == graph_doc else 0
+    n_priority += 1 if name and len(docs) > n_priority else 0
+    priority = docs[:n_priority]
+    rest = docs[n_priority:]
+    reranked_rest = _rerank_docs(question, rest, client, top_k=max(n_results - n_priority, 4))
     docs = priority + reranked_rest
 
     context = "\n\n---\n\n".join(docs)
@@ -415,18 +462,37 @@ def ask(
         }
     )
 
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
-        system=[
-            {
-                "type": "text",
-                "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=api_messages,
-    )
+    system_block = [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}]
+
+    response = None
+    for _ in range(4):  # max tool-use roundtrips
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            system=system_block,
+            tools=_TOOLS,
+            messages=api_messages,
+        )
+
+        if response.stop_reason != "tool_use":
+            break
+
+        # Append assistant turn and execute each tool call
+        api_messages.append({"role": "assistant", "content": response.content})
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                result = _execute_tool_call(block.name, block.input, G, bucket, jobs_prefix)
+                print(f"[tool] {block.name}({block.input}) -> {result[:80]}...")
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result,
+                })
+        api_messages.append({"role": "user", "content": tool_results})
+
+    if response is None:
+        return ""
     block = next((b for b in response.content if b.type == "text"), None)
     return block.text if block else ""
 
@@ -463,62 +529,24 @@ def impact_analysis(dataset_name: str, G: nx.DiGraph) -> None:
                 print(f"    {tag} {name}")
 
 
-def _downstream_layers(
-    G: nx.DiGraph, start: str, max_depth: int = 6
-) -> list[list[tuple]]:
-    visited = {start}
-    frontier = {start}
-    layers = []
-
-    for _ in range(max_depth):
-        next_frontier: set[str] = set()
-        layer: list[tuple] = []
-        for node in frontier:
-            for succ in G.successors(node):
-                if succ not in visited:
-                    visited.add(succ)
-                    next_frontier.add(succ)
-                    kind = G.nodes[succ].get("kind", "?")
-                    name = G.nodes[succ].get("name", succ)
-                    layer.append((kind, name))
-        if not layer:
-            break
-        layers.append(layer)
-        frontier = next_frontier
-
-    return layers
-
 
 # ── Sync ──────────────────────────────────────────────────────────────────────
-
-
 def sync(
     events_path: str = EVENTS_PATH,
     bucket: str | None = None,
     events_prefix: str = "openlineage/parsed/",
     jobs_prefix: str = "glue/code/jobs/",
 ) -> tuple[nx.DiGraph, chromadb.Collection]:
+    job_code: dict[str, str] = {}
+
     if bucket:
-        print(f"[sync] Loading from s3://{bucket}/{events_prefix} ...")
+        print(f"[sync] Loading events from s3://{bucket}/{events_prefix} ...")
         events = load_events_s3(bucket, events_prefix)
         print(f"[sync] {len(events)} events loaded from S3")
-        events = [
-            ev
-            for ev in events
-            if "execute_save_into_data_source_command"
-            in ev.get("job", {}).get("name", "")
-            and ev.get("eventType") == "COMPLETE"
-            and len(ev.get("outputs", [])) > 0
-            and len(ev.get("inputs", [])) > 0
-        ]
-        print(f"[sync] {len(events)} valid events after filtering")
-        import json as _json
-
-        os.makedirs(os.path.dirname(EVENTS_PATH), exist_ok=True)
-        with open(EVENTS_PATH, "w") as _f:
-            for _ev in events:
-                _f.write(_json.dumps(_ev) + "\n")
-        print(f"[sync] Events persisted to {EVENTS_PATH}")
+        if jobs_prefix:
+            print(f"[sync] Loading job code from s3://{bucket}/{jobs_prefix} ...")
+            job_code = load_job_code_s3(bucket, jobs_prefix)
+            print(f"[sync] {len(job_code)} .py files loaded from S3")
     else:
         print(f"[sync] Loading events from {events_path} ...")
         events = load_events(events_path)
@@ -530,48 +558,21 @@ def sync(
         print(f"[sync] {len(events)} events loaded")
 
     G = build_graph(events)
+    if job_code:
+        from rag.ingest import enrich_graph_with_code
+        enrich_graph_with_code(G, job_code)
 
     n_ds = sum(1 for _, d in G.nodes(data=True) if d.get("kind") == "dataset")
     n_job = sum(1 for _, d in G.nodes(data=True) if d.get("kind") == "job")
     print(f"[sync] Graph: {n_ds} datasets, {n_job} jobs, {G.number_of_edges()} edges")
 
-    collection = build_index(G)
+    collection = build_index(G, job_code=job_code)
     print(f"[sync] ChromaDB index: {collection.count()} documents")
 
     return G, collection
 
 
-def _load_existing_or_sync() -> tuple[nx.DiGraph, chromadb.Collection]:
-    events = load_events()
-    G = build_graph(events)
-    collection = build_index(G)
-    print(f"[info] Index updated: {collection.count()} documents")
-
-    return G, collection
-
-
-# ── Chat persistence ─────────────────────────────────────────────────────────
-
-
-def _save_chat(question: str, answer: str, chat_dir: str = CHAT_DIR) -> None:
-    os.makedirs(chat_dir, exist_ok=True)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    path = os.path.join(chat_dir, f"{today}.md")
-
-    is_new = not os.path.exists(path)
-    with open(path, "a") as f:
-        if is_new:
-            f.write(f"# Lineage chat - {today}\n\n")
-        f.write(f"## {ts}\n\n")
-        f.write(f"**Question:** {question}\n\n")
-        f.write(f"{answer}\n\n")
-        f.write("---\n\n")
-
-    print(f"\n[chat] Saved to {path}")
-
-
-def _load_history(n: int = 5, chat_dir: str = CHAT_DIR) -> list[dict]:
+def load_history(n: int = 5, chat_dir: str = CHAT_DIR) -> list[dict]:
     """Load the last n Q&A pairs from chat files as conversation history."""
     if not os.path.isdir(chat_dir):
         return []
@@ -589,7 +590,6 @@ def _load_history(n: int = 5, chat_dir: str = CHAT_DIR) -> list[dict]:
         with open(path) as f:
             content = f.read()
 
-        # Each entry is separated by "---\n\n" and contains **Question:** ...
         entries = content.split("---\n\n")
         for entry in reversed(entries):
             if len(pairs) >= n:
@@ -598,7 +598,6 @@ def _load_history(n: int = 5, chat_dir: str = CHAT_DIR) -> list[dict]:
             if not m_q:
                 continue
             question = m_q.group(1).strip()
-            # The answer is everything after the question line
             after_q = entry[m_q.end():].strip()
             if after_q:
                 pairs.append((question, after_q))
@@ -609,104 +608,3 @@ def _load_history(n: int = 5, chat_dir: str = CHAT_DIR) -> list[dict]:
         history.append({"role": "assistant", "content": answer})
 
     return history
-
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="RAG over data lineage (OpenLineage + Claude)"
-    )
-    parser.add_argument("--bucket", help="S3 bucket (enables production mode)")
-    parser.add_argument(
-        "--events-prefix", default="openlineage/", help="S3 events prefix"
-    )
-    parser.add_argument(
-        "--jobs-prefix", default="glue/code/jobs/", help="S3 Glue jobs prefix"
-    )
-
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    p_ask = sub.add_parser("ask", help="Single natural language question")
-    p_ask.add_argument("question", nargs="+", help="Question")
-    p_ask.add_argument(
-        "--n", type=int, default=20, help="Chunks to retrieve (default: 20)"
-    )
-
-    p_chat = sub.add_parser("chat", help="Interactive mode with persistent history")
-    p_chat.add_argument(
-        "--n", type=int, default=20, help="Chunks to retrieve (default: 20)"
-    )
-    p_chat.add_argument(
-        "--history", type=int, default=5, metavar="K",
-        help="Previous Q&A pairs to load as initial context (default: 5)"
-    )
-
-    p_impact = sub.add_parser("impact", help="Downstream impact analysis for a dataset")
-    p_impact.add_argument("dataset", help="Dataset name (or partial name)")
-
-    sub.add_parser("sync", help="Re-ingest and re-vectorize events")
-    sub.add_parser("watch", help="Near real-time mode (file watcher or S3 polling)")
-
-    args = parser.parse_args()
-
-    if args.cmd == "sync":
-        sync(
-            bucket=args.bucket,
-            events_prefix=args.events_prefix,
-            jobs_prefix=args.jobs_prefix,
-        )
-        return
-
-    if args.cmd == "watch":
-        if args.bucket:
-            from rag.watcher import start_watching_s3
-
-            start_watching_s3(args.bucket, args.events_prefix, args.jobs_prefix)
-        else:
-            from rag.watcher import start_watching
-
-            start_watching()
-        return
-
-    G, collection = _load_existing_or_sync()
-
-    if args.cmd == "ask":
-        question = " ".join(args.question)
-        print(f"\nQuestion: {question}\n{'─'*60}")
-        answer = ask(question, collection, n_results=args.n, G=G)
-        print(answer)
-        _save_chat(question, answer)
-
-    elif args.cmd == "chat":
-        history = _load_history(n=args.history)
-        if history:
-            print(f"[chat] {len(history) // 2} previous conversations loaded as context.")
-        print("Interactive chat mode. Type 'exit' or press Ctrl+C to quit.\n")
-        while True:
-            try:
-                question = input("You: ").strip()
-            except (KeyboardInterrupt, EOFError):
-                print("\n[chat] Session ended.")
-                break
-            if not question:
-                continue
-            if question.lower() in {"salir", "exit", "quit"}:
-                print("[chat] Session ended.")
-                break
-
-            print(f"{'─'*60}")
-            answer = ask(question, collection, n_results=args.n, history=history, G=G)
-            print(f"\n{answer}\n")
-            _save_chat(question, answer)
-
-            history.append({"role": "user", "content": question})
-            history.append({"role": "assistant", "content": answer})
-
-    elif args.cmd == "impact":
-        impact_analysis(args.dataset, G)
-
-
-if __name__ == "__main__":
-    main()

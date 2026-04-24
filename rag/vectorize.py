@@ -34,11 +34,7 @@ def build_index(
               If provided, enriches job chunks with Glue source code.
     """
     client = chromadb.PersistentClient(path=persist_dir)
-    try:
-        client.delete_collection("lineage")
-    except Exception:
-        pass
-    collection = client.create_collection("lineage", embedding_function=_EMBEDDING_FN)  # type: ignore[arg-type]
+    collection = client.get_or_create_collection("lineage", embedding_function=_EMBEDDING_FN)  # type: ignore[arg-type]
     docs, ids, metas = [], [], []
 
     for node_key in G.nodes:
@@ -140,7 +136,6 @@ def _serialize_dataset(G: nx.DiGraph, key: str, node: dict) -> str:
 def _serialize_job(G: nx.DiGraph, key: str, node: dict, job_code: dict) -> str:
     name = node.get("name", "?")
     ns = node.get("namespace", "?")
-    sql = node.get("sql", "")
     runs = node.get("runs", [])
 
     inputs = [
@@ -174,11 +169,9 @@ def _serialize_job(G: nx.DiGraph, key: str, node: dict, job_code: dict) -> str:
     ]
     if last_run:
         lines.append(f"Last event: {last_run['type']} at {last_run['ts']}")
-    if sql:
-        lines.append(f"SQL transformation:\n{sql.strip()}")
 
-    # if glue_code:
-    #     lines.append(f"Glue source code:\n{glue_code}")
+    if glue_code:
+        lines.append(f"Glue source code:\n{glue_code}")
 
     return "\n".join(lines)
 

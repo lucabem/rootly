@@ -18,8 +18,6 @@ services:
   redis:
     image: redis:7-alpine
     container_name: redis
-    logging:
-      driver: "none"
     ports:
       - "6379:6379"
     healthcheck:
@@ -66,8 +64,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     container_name: celery-worker
-    logging:
-      driver: "none"
+
     env_file: .env
     volumes:
       - ./openlineage:/app/openlineage
@@ -87,8 +84,7 @@ services:
       context: frontend
       dockerfile: Dockerfile
     container_name: rag-ui
-    logging:
-      driver: "none"
+
     ports:
       - "8080:80"
     depends_on:
@@ -99,13 +95,13 @@ services:
   #  SPARK  (PySpark + OpenLineage — genera openlineage/events.ndjson)
   # ════════════════════════════════════════════════════════════════════════════
 
-  spark:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: spark
-    volumes:
-      - ./examples:/app/examples
-      - ./openlineage:/app/openlineage
-      - ivy_cache:/root/.ivy2
-    command: ["tail", "-f", "/dev/null"]
+  # spark:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: spark
+  #   volumes:
+  #     - ./examples:/app/examples
+  #     - ./openlineage:/app/openlineage
+  #     - ivy_cache:/root/.ivy2
+  #   command: ["tail", "-f", "/dev/null"]

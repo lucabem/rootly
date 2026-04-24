@@ -82,7 +82,11 @@ export default function App() {
   const [tasks, setTasks] = useState<TaskEntry[]>(loadTasks)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
-  const pendingTasks = tasks.filter(t => t.status === 'PENDING' || t.status === 'STARTED')
+  const MAX_TASK_AGE_MS = 24 * 60 * 60 * 1000
+  const pendingTasks = tasks.filter(t =>
+    (t.status === 'PENDING' || t.status === 'STARTED') &&
+    Date.now() - t.started_at < MAX_TASK_AGE_MS
+  )
 
   // Initial load
   useEffect(() => { fetchStats(); fetchDatasets(); fetchHistory() }, [])

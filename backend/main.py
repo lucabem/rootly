@@ -1,4 +1,5 @@
 import os
+import time
 import threading
 from datetime import datetime, timezone
 
@@ -21,20 +22,18 @@ from backend.tasks import (
 )
 from rag.ingest import (
     build_graph,
-    enrich_graph_with_code,
     load_events,
-    load_jobs_code,
-    load_job_code_s3,
 )
-from rag.query import ask, _load_history, _downstream_layers
-from rag.vectorize import build_index, get_collection
+from rag.tools.dataset import downstream_layers as _downstream_layers
+from rag.query import ask, load_history, _downstream_layers
+from rag.vectorize import get_collection
 
 app = FastAPI(title="RAG Lineage API")
 
 
-@app.on_event("startup")
-def startup():
-    threading.Thread(target=_ensure_loaded, daemon=True).start()
+# @app.on_event("startup")
+# def startup():
+#     threading.Thread(target=_ensure_loaded, daemon=True).start()
 
 
 app.add_middleware(
@@ -44,8 +43,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_state: dict = {"G": None, "collection": None}
+_state: dict = {"G": None, "collection": None, "loaded_at": 0.0}
 _load_lock = threading.Lock()
+_last_reloaded_task: str | None = None
 
 CHAT_DIR = "/app/chat"
 
@@ -53,28 +53,18 @@ CHAT_DIR = "/app/chat"
 def _ensure_loaded():
     if _state["collection"] is not None:
         return _state["G"], _state["collection"]
+
     with _load_lock:
-        if _state["collection"] is not None:
+        if _state["collection"] is not None:  # otro hilo cargó mientras esperábamos
             return _state["G"], _state["collection"]
-        print("Loading events and building graph...")
+
         events = load_events()
         G = build_graph(events)
-        print(
-            f"Graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges."
-        )
-        _examples = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
-        job_code = (
-            load_job_code_s3(S3_BUCKET, S3_JOBS_PREFIX)
-            if S3_BUCKET
-            else load_jobs_code(path=_examples)
-        )
-        if job_code:
-            print(f"Code for {len(job_code)} jobs loaded, enriching graph...")
-            enrich_graph_with_code(G, job_code)
-        collection = build_index(G)
-        print(f"Index built: {collection.count()} documents.")
-        _state["G"] = G
-        _state["collection"] = collection
+        collection = get_collection()
+        if collection.count() == 0:
+            print("[ensure_loaded] WARNING: ChromaDB is empty. Run /api/sync.")
+        _state.update({"G": G, "collection": collection, "loaded_at": time.time()})
+
     return _state["G"], _state["collection"]
 
 
@@ -139,7 +129,15 @@ def stats():
 def chat(req: ChatRequest):
     try:
         history = [{"role": m.role, "content": m.content} for m in req.history]
-        answer = ask(req.question, _state["collection"], n_results=req.n, history=history, G=_state["G"])
+        answer = ask(
+            req.question,
+            _state["collection"],
+            n_results=req.n,
+            history=history,
+            G=_state["G"],
+            bucket=S3_BUCKET,
+            jobs_prefix=S3_JOBS_PREFIX,
+        )
         _save_chat(req.question, answer)
         return {"answer": answer}
     except Exception as e:
@@ -229,12 +227,32 @@ def do_sync():
 
 @app.get("/api/task/{task_id}")
 def task_status(task_id: str):
+    global _last_reloaded_task
     result = AsyncResult(task_id, app=celery_app)
     data: dict = {"task_id": task_id, "status": result.state}
     if result.state == "SUCCESS":
         data["result"] = result.result
+        should_reload = False
+        with _load_lock:
+            if _last_reloaded_task != task_id:
+                _last_reloaded_task = task_id
+                completed_at = (result.result or {}).get("completed_at", 0.0)
+                already_fresh = _state["loaded_at"] >= completed_at > 0
+                if already_fresh:
+                    print(f"[task_status] task={task_id} SUCCESS — state already loaded after sync, skipping reload.")
+                else:
+                    print(f"[task_status] task={task_id} SUCCESS — scheduling reload.")
+                    _state["G"] = None
+                    _state["collection"] = None
+                    _state["loaded_at"] = 0.0
+                    should_reload = True
+            else:
+                print(f"[task_status] task={task_id} SUCCESS (already processed) — skipping reload.")
+        if should_reload:
+            threading.Thread(target=_ensure_loaded, daemon=True, name=f"reload-{task_id[:8]}").start()
     elif result.state == "FAILURE":
         data["error"] = str(result.result)
+        print(f"[task_status] task={task_id} FAILURE: {result.result}")
     return data
 
 
@@ -251,7 +269,6 @@ def graph():
             "name": data.get("name", key),
             "namespace": data.get("namespace", ""),
             "has_code": bool(data.get("glue_code")),
-            "has_sql": bool(data.get("sql")),
             "has_column_lineage": bool(data.get("column_lineage")),
             "format": data.get("format", ""),
         })
@@ -344,7 +361,7 @@ def trace(dataset: str, field: str | None = None):
 
 @app.get("/api/history")
 def history(n: int = 20):
-    msgs = _load_history(n=n, chat_dir=CHAT_DIR)
+    msgs = load_history(n=n, chat_dir=CHAT_DIR)
     return {"messages": msgs}
 
 

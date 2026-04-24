@@ -105,6 +105,34 @@ def load_job_code_s3(bucket: str, prefix: str = "glue/code/jobs/") -> dict[str, 
     return job_code
 
 
+def fetch_single_job_code_s3(bucket: str, prefix: str, job_name: str) -> str | None:
+    """Fetch a single .py file from S3 matching job_name (exact, suffix, or fuzzy)."""
+    s3 = boto3.client("s3")
+    norm_target = _normalize_job_name(job_name)
+
+    candidates: list[tuple[str, float]] = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if not key.endswith(".py"):
+                continue
+            fname = os.path.basename(key).removesuffix(".py")
+            norm_fname = _normalize_job_name(fname)
+            if norm_target == norm_fname or norm_target.endswith(norm_fname) or norm_fname.endswith(norm_target):
+                candidates.append((key, 1.0))
+            else:
+                score = _similarity(norm_target, norm_fname)
+                if score >= _SIMILARITY_THRESHOLD:
+                    candidates.append((key, score))
+
+    if not candidates:
+        return None
+
+    best_key = max(candidates, key=lambda x: x[1])[0]
+    return s3.get_object(Bucket=bucket, Key=best_key)["Body"].read().decode()
+
+
 def _normalize_job_name(name: str) -> str:
     """job_alianzas_tnpi_dim_margen -> alianzas_tnpi_dim_margen
     ALIANZAS-tnpi_dim_margen    -> alianzas_tnpi_dim_margen"""
@@ -138,10 +166,11 @@ def enrich_graph_with_code(G: nx.DiGraph, job_code: dict[str, str]) -> None:
         job_name = data.get("name", "")
         norm_job = _normalize_job_name(job_name)
 
+        print(f"Matching job '{job_name}' (normalized: '{norm_job}'):")
         # 1) Exact normalized match
         match = norm_index.get(norm_job)
         if match:
-            logger.debug("  [exact]  %s -> %s", norm_job, match[0])
+            print(f"  [exact]  {norm_job} -> {match[0]}")
 
         # 2) Suffix match (OL may add namespace/prefix)
         if match is None:
@@ -154,7 +183,7 @@ def enrich_graph_with_code(G: nx.DiGraph, job_code: dict[str, str]) -> None:
                 None,
             )
             if match:
-                logger.debug("  [suffix] %s -> %s", norm_job, match[0])
+                print(f"  [suffix] {norm_job} -> {match[0]}")
 
         # 3) Best fuzzy match above threshold
         if match is None:
@@ -165,16 +194,9 @@ def enrich_graph_with_code(G: nx.DiGraph, job_code: dict[str, str]) -> None:
                     best_score, best_val = score, v
             if best_score >= _SIMILARITY_THRESHOLD and best_val is not None:
                 match = best_val
-                logger.debug(
-                    "  [fuzzy]  %s -> %s (score=%.2f)", norm_job, best_val[0], best_score
-                )
+                print(f"  [fuzzy]  {norm_job} -> {best_val[0]} (score={best_score:.2f})")
             else:
-                logger.warning(
-                    "  [miss]   %s - best score=%.2f (threshold=%.2f)",
-                    norm_job,
-                    best_score,
-                    _SIMILARITY_THRESHOLD,
-                )
+                print(f"  [miss]   {norm_job} - best score={best_score:.2f} (threshold={_SIMILARITY_THRESHOLD:.2f})")
 
         if match:
             G.nodes[node_key]["glue_code"] = match[1]
@@ -207,16 +229,11 @@ def _process_event(G: nx.DiGraph, ev: dict) -> None:
             kind="job",
             namespace=job.get("namespace", ""),
             name=job_name,
-            sql="",
             runs=[],
         )
 
     if event_type and ts:
         G.nodes[job_key]["runs"].append({"type": event_type, "ts": ts})
-
-    sql = _extract_sql(ev)
-    if sql:
-        G.nodes[job_key]["sql"] = sql
 
     for ds in ev.get("inputs", []):
         ds_key = _dataset_key(ds)
@@ -296,10 +313,6 @@ def _upsert_dataset(G: nx.DiGraph, key: str, ds: dict) -> None:
                 else:
                     merged[field] = sources
             G.nodes[key]["column_lineage"] = merged
-
-
-def _extract_sql(ev: dict) -> str:
-    return ev.get("job", {}).get("facets", {}).get("sql", {}).get("query", "")
 
 
 def _infer_format(name: str, facets: dict) -> str:

@@ -1,4 +1,5 @@
 import os
+import time
 
 from celery import Celery
 from dotenv import load_dotenv
@@ -17,6 +18,7 @@ celery_app.conf.update(
     result_serializer="json",
     accept_content=["json"],
     task_track_started=True,
+    result_expires=86400,  # 24h
 )
 
 
@@ -37,4 +39,5 @@ def run_sync_task(self, bucket, events_prefix, jobs_prefix):
         "datasets": n_ds,
         "jobs": n_job,
         "source": f"s3://{bucket}/{events_prefix}" if bucket else "local",
+        "completed_at": time.time(),
     }
