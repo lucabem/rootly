@@ -342,7 +342,7 @@ def ask(
 
     # 4b. General semantic search (more candidates for reranking)
     fetch_n = min(n_results * 2, 40)
-    results = collection.query(query_texts=[search_query], n_results=fetch_n)
+    results = collection.query(query_texts=[f"query: {search_query}"], n_results=fetch_n)
     for doc, meta in zip(
         results.get("documents", [[]])[0],
         results.get("metadatas", [[]])[0],

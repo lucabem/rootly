@@ -29,6 +29,7 @@ def run_sync_task(self, bucket, events_prefix, jobs_prefix):
         events_prefix=events_prefix,
         jobs_prefix=jobs_prefix,
     )
+
     n_ds = sum(1 for _, d in G.nodes(data=True) if d.get("kind") == "dataset")
     n_job = sum(1 for _, d in G.nodes(data=True) if d.get("kind") == "job")
     return {

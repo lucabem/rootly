@@ -1,5 +1,6 @@
 # RAG sobre linaje de datos
 chromadb>=0.5.0
+sentence-transformers>=3.0.0
 networkx>=3.0
 anthropic>=0.40.0
 watchdog>=4.0.0

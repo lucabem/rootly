@@ -12,13 +12,18 @@ import os
 
 import chromadb
 import networkx as nx
+from rag.knowledge import index_knowledge
+from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
 CHROMA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".chroma")
+
+# PRO -> intfloat/multilingual-e5-large
+_EMBEDDING_FN = SentenceTransformerEmbeddingFunction(model_name="intfloat/multilingual-e5-large")
 
 
 def get_collection(persist_dir: str = CHROMA_DIR) -> chromadb.Collection:
     client = chromadb.PersistentClient(path=persist_dir)
-    return client.get_or_create_collection("lineage")
+    return client.get_or_create_collection("lineage", embedding_function=_EMBEDDING_FN)  # type: ignore[arg-type]
 
 
 def build_index(
@@ -33,7 +38,7 @@ def build_index(
         client.delete_collection("lineage")
     except Exception:
         pass
-    collection = client.create_collection("lineage")
+    collection = client.create_collection("lineage", embedding_function=_EMBEDDING_FN)  # type: ignore[arg-type]
     docs, ids, metas = [], [], []
 
     for node_key in G.nodes:
@@ -65,7 +70,13 @@ def build_index(
             metas.append({"kind": "impact_chain", "name": data.get("name", ""), "namespace": ""})
 
     if docs:
+        docs = [f"passage: {d}" for d in docs]
         collection.upsert(documents=docs, ids=ids, metadatas=metas)
+
+    
+    n_knowledge = index_knowledge(collection)
+    if n_knowledge:
+        print(f"[knowledge] {n_knowledge} chunks indexed from knowledge/")
 
     return collection
 

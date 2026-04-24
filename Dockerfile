@@ -11,13 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# ── Pre-descarga de JARs Maven (Hudi + Delta + Iceberg + OpenLineage) ──────────
-# Se ejecuta en build time para que los `docker compose run` no tarden minutos.
-ENV PACKAGES="\
-org.apache.hudi:hudi-spark3.5-bundle_2.12:0.15.0,\
-io.delta:delta-spark_2.12:3.2.0,\
-org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1,\
-io.openlineage:openlineage-spark_2.12:1.43.0"
+# ── Pre-descarga del JAR de OpenLineage en build time ─────────────────────────
+ENV PACKAGES="io.openlineage:openlineage-spark_2.12:1.43.0"
 
 RUN python -c "\
 from pyspark.sql import SparkSession; \
@@ -32,6 +27,4 @@ SparkSession.builder \
 WORKDIR /app
 COPY . /app/
 
-RUN mkdir -p /app/data/hudi/orders \
-             /app/data/delta/customers \
-             /app/openlineage/data/iceberg
+RUN mkdir -p /app/openlineage

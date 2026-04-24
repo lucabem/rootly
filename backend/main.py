@@ -26,8 +26,8 @@ from rag.ingest import (
     load_jobs_code,
     load_job_code_s3,
 )
-from rag.query import ask, _downstream_layers
-from rag.vectorize import build_index
+from rag.query import ask, _load_history, _downstream_layers
+from rag.vectorize import build_index, get_collection
 
 app = FastAPI(title="RAG Lineage API")
 
@@ -62,14 +62,15 @@ def _ensure_loaded():
         print(
             f"Graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges."
         )
-        # job_code = (
-        #     load_job_code_s3(S3_BUCKET, S3_JOBS_PREFIX)
-        #     if S3_BUCKET
-        #     else load_jobs_code()
-        # )
-        # if job_code:
-        #     print(f"Code for {len(job_code)} jobs loaded, enriching graph...")
-        #     enrich_graph_with_code(G, job_code)
+        _examples = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
+        job_code = (
+            load_job_code_s3(S3_BUCKET, S3_JOBS_PREFIX)
+            if S3_BUCKET
+            else load_jobs_code(path=_examples)
+        )
+        if job_code:
+            print(f"Code for {len(job_code)} jobs loaded, enriching graph...")
+            enrich_graph_with_code(G, job_code)
         collection = build_index(G)
         print(f"Index built: {collection.count()} documents.")
         _state["G"] = G
@@ -142,7 +143,13 @@ def chat(req: ChatRequest):
         _save_chat(req.question, answer)
         return {"answer": answer}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        err = str(e)
+        if "rate_limit_error" in err or "rate limit" in err.lower():
+            raise HTTPException(
+                status_code=429,
+                detail="Límite de uso de la API alcanzado. Espera unos segundos e inténtalo de nuevo.",
+            )
+        raise HTTPException(status_code=500, detail=err)
 
 
 @app.get("/api/datasets")
@@ -333,6 +340,12 @@ def trace(dataset: str, field: str | None = None):
         })
 
     return {"results": results}
+
+
+@app.get("/api/history")
+def history(n: int = 20):
+    msgs = _load_history(n=n, chat_dir=CHAT_DIR)
+    return {"messages": msgs}
 
 
 @app.get("/api/config")

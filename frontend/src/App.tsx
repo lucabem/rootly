@@ -85,7 +85,7 @@ export default function App() {
   const pendingTasks = tasks.filter(t => t.status === 'PENDING' || t.status === 'STARTED')
 
   // Initial load
-  useEffect(() => { fetchStats(); fetchDatasets() }, [])
+  useEffect(() => { fetchStats(); fetchDatasets(); fetchHistory() }, [])
 
   // Auto-scroll chat
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, loading])
@@ -136,6 +136,19 @@ export default function App() {
     return () => clearInterval(interval)
   }, [pendingTasks])
 
+  async function fetchHistory() {
+    try {
+      const r = await fetch('/api/history?n=30')
+      const data = await r.json()
+      const loaded: Message[] = (data.messages ?? []).map((m: { role: Role; content: string }) => ({
+        id: ++msgId,
+        role: m.role,
+        content: m.content,
+      }))
+      if (loaded.length > 0) setMessages(loaded)
+    } catch { /* silent */ }
+  }
+
   async function fetchDatasets() {
     try {
       const r = await fetch('/api/datasets')
@@ -168,6 +181,7 @@ export default function App() {
         body: JSON.stringify({ question: q, history }),
       })
       const data = await r.json()
+      if (r.status === 429) throw new Error(data.detail || 'Límite de uso alcanzado. Espera unos segundos e inténtalo de nuevo.')
       if (!r.ok) throw new Error(data.detail || 'Error del servidor')
       setMessages(prev => [...prev, { id: ++msgId, role: 'assistant', content: data.answer }])
     } catch (e: any) {

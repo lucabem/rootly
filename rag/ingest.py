@@ -43,6 +43,7 @@ def load_jobs_code(
     path: str = os.path.join(BASE_DIR, "glue", "code", "jobs")
 ) -> dict[str, str]:
     job_code = {}
+    print(f"Loading job code from {path}...")
     if not os.path.exists(path):
         return job_code
     for fname in os.listdir(path):
@@ -312,4 +313,4 @@ def _infer_format(name: str, facets: dict) -> str:
         return "hudi"
     # Extract from path if it follows the .../format/... pattern
     match = re.search(r"/(hudi|delta|iceberg)/", lower)
-    return match.group(1) if match else "unknown"
+    return match.group(1) if match else "parquet"
