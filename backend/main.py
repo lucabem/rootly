@@ -26,14 +26,14 @@ from rag.ingest import (
 )
 from rag.tools.dataset import downstream_layers as _downstream_layers
 from rag.query import ask, load_history, _downstream_layers
-from rag.vectorize import get_collection
+from rag.vectorize import get_collection, load_graph_cache
 
 app = FastAPI(title="RAG Lineage API")
 
 
-# @app.on_event("startup")
-# def startup():
-#     threading.Thread(target=_ensure_loaded, daemon=True).start()
+@app.on_event("startup")
+def startup():
+    threading.Thread(target=_ensure_loaded, daemon=True).start()
 
 
 app.add_middleware(
@@ -58,11 +58,20 @@ def _ensure_loaded():
         if _state["collection"] is not None:  # otro hilo cargó mientras esperábamos
             return _state["G"], _state["collection"]
 
-        events = load_events()
-        G = build_graph(events)
         collection = get_collection()
-        if collection.count() == 0:
-            print("[ensure_loaded] WARNING: ChromaDB is empty. Run /api/sync.")
+        if collection.count() > 0:
+            G = load_graph_cache()
+            if G is not None:
+                print(f"[ensure_loaded] Restored from cache — {G.number_of_nodes()} nodes, {collection.count()} docs in ChromaDB.")
+            else:
+                print("[ensure_loaded] ChromaDB has data but no graph cache — rebuilding from local events.")
+                events = load_events()
+                G = build_graph(events)
+        else:
+            print("[ensure_loaded] ChromaDB is empty. Run /api/sync to populate.")
+            events = load_events()
+            G = build_graph(events)
+
         _state.update({"G": G, "collection": collection, "loaded_at": time.time()})
 
     return _state["G"], _state["collection"]
@@ -278,32 +287,87 @@ def graph():
     return {"nodes": nodes, "edges": edges}
 
 
+@app.get("/api/namespaces")
+def namespaces():
+    G = _state["G"]
+    if G is None:
+        return {"namespaces": []}
+    ns = sorted({
+        d.get("namespace", "")
+        for _, d in G.nodes(data=True)
+        if d.get("kind") == "dataset" and d.get("namespace")
+    })
+    return {"namespaces": ns}
+
+
+@app.get("/api/tables")
+def tables(namespace: str = ""):
+    G = _state["G"]
+    if G is None:
+        return {"tables": []}
+    result = sorted({
+        d.get("name", k)
+        for k, d in G.nodes(data=True)
+        if d.get("kind") == "dataset"
+        and (not namespace or d.get("namespace", "") == namespace)
+    })
+    return {"tables": result}
+
+
+@app.get("/api/schema")
+def schema(dataset: str, namespace: str | None = None):
+    G = _state["G"]
+    if G is None:
+        raise HTTPException(status_code=503, detail="Graph not loaded yet.")
+    matches = [
+        d for _, d in G.nodes(data=True)
+        if d.get("kind") == "dataset"
+        and d.get("name", "").lower() == dataset.lower()
+        and (not namespace or d.get("namespace", "") == namespace)
+    ]
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"Dataset '{dataset}' not found.")
+    node = matches[0]
+    columns = []
+    for raw in node.get("schema", []):
+        if " (" in raw and raw.endswith(")"):
+            name, type_part = raw.rsplit(" (", 1)
+            columns.append({"name": name, "type": type_part[:-1]})
+        else:
+            columns.append({"name": raw, "type": ""})
+    return {
+        "dataset": node.get("name"),
+        "namespace": node.get("namespace"),
+        "columns": columns,
+    }
+
+
 @app.get("/api/trace")
-def trace(dataset: str, field: str | None = None):
+def trace(dataset: str, field: str | None = None, namespace: str | None = None):
     """
     Trace column-level lineage for a field in a dataset.
     Useful for GDPR audits: find the exact origin of a sensitive field.
 
     ?dataset=customers&field=email  -> recursive trace of email in customers
     ?dataset=customers              -> full column lineage for the dataset
+    ?namespace=ns&dataset=customers -> scoped to a specific namespace
     """
     G = _state["G"]
     if G is None:
         raise HTTPException(status_code=503, detail="Graph not loaded yet.")
 
-    matches = [
-        (k, d)
-        for k, d in G.nodes(data=True)
-        if d.get("kind") == "dataset"
-        and dataset.lower() in d.get("name", "").lower()
-    ]
+    all_ds = [(k, d) for k, d in G.nodes(data=True) if d.get("kind") == "dataset"]
+    if namespace:
+        all_ds = [(k, d) for k, d in all_ds if d.get("namespace", "") == namespace]
+    exact = [(k, d) for k, d in all_ds if d.get("name", "").lower() == dataset.lower()]
+    matches = exact or [(k, d) for k, d in all_ds if dataset.lower() in d.get("name", "").lower()]
     if not matches:
         raise HTTPException(status_code=404, detail=f"Dataset '{dataset}' not found.")
 
     def _trace_field(ds_name: str, out_field: str, visited: set, depth: int) -> dict:
         """Recursively trace a field back to its origins."""
         if depth > 6 or (ds_name, out_field) in visited:
-            return {"field": out_field, "dataset": ds_name, "sources": [], "cycle": depth > 6}
+            return {"field": out_field, "dataset": ds_name, "namespace": "", "sources": [], "cycle": depth > 6}
         visited.add((ds_name, out_field))
 
         src_node = next(
@@ -313,6 +377,7 @@ def trace(dataset: str, field: str | None = None):
             ),
             None,
         )
+        ns = src_node[1].get("namespace", "") if src_node else ""
         col_lineage = src_node[1].get("column_lineage", {}) if src_node else {}
         sources_meta = col_lineage.get(out_field, [])
 
@@ -323,7 +388,7 @@ def trace(dataset: str, field: str | None = None):
             child["transform_subtype"] = s.get("subtype", "?")
             sources.append(child)
 
-        return {"field": out_field, "dataset": ds_name, "sources": sources}
+        return {"field": out_field, "dataset": ds_name, "namespace": ns, "sources": sources}
 
     results = []
     for node_key, data in matches:

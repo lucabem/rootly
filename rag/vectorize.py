@@ -8,6 +8,7 @@ Each graph node produces one document. Additionally, for each source dataset
 describing transitive downstream dependencies.
 """
 
+import json
 import os
 
 import chromadb
@@ -16,9 +17,31 @@ from rag.knowledge import index_knowledge
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
 CHROMA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".chroma")
+GRAPH_CACHE_PATH = os.path.join(CHROMA_DIR, "graph_cache.json")
 
 # PRO -> intfloat/multilingual-e5-large
 _EMBEDDING_FN = SentenceTransformerEmbeddingFunction(model_name="intfloat/multilingual-e5-large")
+
+
+def save_graph_cache(G: nx.DiGraph, path: str = GRAPH_CACHE_PATH) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(nx.node_link_data(G), f)
+    print(f"[graph_cache] Saved {G.number_of_nodes()} nodes → {path}")
+
+
+def load_graph_cache(path: str = GRAPH_CACHE_PATH) -> nx.DiGraph | None:
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        G = nx.node_link_graph(data)
+        print(f"[graph_cache] Loaded {G.number_of_nodes()} nodes from {path}")
+        return G
+    except Exception as e:
+        print(f"[graph_cache] Failed to load: {e}")
+        return None
 
 
 def get_collection(persist_dir: str = CHROMA_DIR) -> chromadb.Collection:
