@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Applies pending CHANGELOG.md entry and amends it into the last commit.
+# Runs only when prepare-commit-msg left a CHANGELOG_PENDING file.
+set -euo pipefail
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$HOOK_DIR/.." && pwd)"
+PENDING="$PROJECT_ROOT/.git/CHANGELOG_PENDING"
+
+[ -f "$PENDING" ] || exit 0
+
+cp "$PENDING" "$PROJECT_ROOT/CHANGELOG.md"
+rm -f "$PENDING"
+
+git -C "$PROJECT_ROOT" add CHANGELOG.md
+git -C "$PROJECT_ROOT" commit --amend --no-edit

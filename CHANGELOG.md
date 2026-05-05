@@ -3,6 +3,9 @@
 ## Unreleased
 
 ### 2026-05-05
+- **refactor(hooks): defer changelog updates to post-commit hook** — Moved changelog file writing to post-commit hook to ensure clean staging area during prepare-commit-msg phase, fixing issues with changelog generation workflow.
+
+### 2026-05-05
 - **style: add Rootly logo to header and empty state** — Added Rootly logo image to application header and empty state UI for improved branding and visual identity.
 
 ### 2026-05-05

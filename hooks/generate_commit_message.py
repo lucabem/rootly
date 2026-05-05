@@ -48,19 +48,9 @@ def update_changelog(project_root: str, commit_msg: str, entry: str) -> None:
     else:
         content = f"# Changelog\n\n## Unreleased\n{block}"
 
-    with open(path, "w") as f:
+    pending = os.path.join(project_root, ".git", "CHANGELOG_PENDING")
+    with open(pending, "w") as f:
         f.write(content)
-
-    try:
-        subprocess.run(["git", "add", "CHANGELOG.md"], cwd=project_root, check=True)
-    except Exception:
-        # Undo the write so the working tree stays clean
-        if original is not None:
-            with open(path, "w") as f:
-                f.write(original)
-        elif os.path.exists(path):
-            os.remove(path)
-        raise
 
 
 def main() -> None:
