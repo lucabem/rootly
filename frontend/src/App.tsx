@@ -322,7 +322,7 @@ export default function App() {
       {/* Header */}
       <header className="header">
         <div className="header-title">
-          <span className="dot" />
+          <img src="/rootly.jpeg" alt="Rootly" className="header-logo" />
           RAG Lineage
         </div>
         <div className="header-stats">
@@ -366,9 +366,7 @@ export default function App() {
               {messages.length === 0 && !loading && (
                 <div className="empty-state">
                   <div className="icon">
-                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2" opacity="0.5">
-                      <circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35M11 8v6M8 11h6" />
-                    </svg>
+                    <img src="/rootly.jpeg" alt="Rootly" className="empty-logo" />
                   </div>
                   <h3>Consulta tu linaje de datos</h3>
                   <p>Pregunta sobre datasets, pipelines, impacto de cambios de schema y más.</p>
