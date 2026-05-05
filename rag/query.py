@@ -36,13 +36,14 @@ import networkx as nx
 from rag.ingest import (
     EVENTS_PATH,
     build_graph,
-
     load_events,
     load_jobs_code,
     load_events_s3,
     load_job_code_s3,
+    list_job_keys_s3,
+    enrich_graph_with_code_keys,
 )
-from rag.vectorize import build_index, get_collection
+from rag.vectorize import build_index, get_collection, save_graph_cache
 from rag.tools import TOOLS as _TOOLS, execute_tool_call as _execute_tool_call
 from rag.tools.dataset import downstream_layers as _downstream_layers
 
@@ -63,7 +64,7 @@ Antes de responder, identifica el tipo:
 - LISTAR TABLAS
 - IMPACTO
 - LINAJE DE COLUMNA
-- CONSULTA ATHENA
+- ATHENA — el usuario quiere que ejecutes una query o que le des datos reales de una tabla
 - GENERAL
 
 Si no es claro, responde como GENERAL.
@@ -72,7 +73,7 @@ Si no es claro, responde como GENERAL.
 
 ### ESQUEMA
 - Lista todas las columnas con su tipo.
-- Si existe "Schema:" en el contexto, úsalo íntegramente sin modificar.
+- El schema nunca está en el contexto inicial: llama a `get_dataset_schema` para obtenerlo.
 - Formato: tabla o lista clara.
 
 ### LISTAR TABLAS
@@ -88,20 +89,23 @@ Si no es claro, responde como GENERAL.
 - Explica brevemente el motivo del impacto.
 
 ### LINAJE DE COLUMNA
-- Usa "Linaje de columnas".
+- Llama a `get_column_lineage` — el linaje nunca está pre-cargado en el contexto.
 - Para cada campo:
   - Origen
   - Tipo de transformación (DIRECT / INDIRECT)
 - Formato estructurado.
+- Incluye siempre el bloque SQL de la transformación al final de la respuesta.
+- Tras obtener el linaje, llama a `get_job_code` sobre el job productor del dataset para adjuntar la SQL relevante.
 
-### CONSULTA ATHENA
-- Genera una query SQL válida para Amazon Athena basándote en la pregunta del usuario y el schema disponible en el contexto.
-- Usa el nombre de tabla y columnas exactamente como aparecen en el schema del contexto.
-- Si se mencionan varias fuentes, combínalas con OR o con UNION según corresponda.
-- Si la pregunta pide un conteo (ej: "cuántos contratos"), usa COUNT(*) o COUNT(DISTINCT <campo_clave>).
-- Añade siempre un comentario SQL encima de la query explicando qué hace.
-- Si el schema no está disponible en el contexto, indica: "No se encontró el schema de la tabla en el contexto. Ejecuta 'sync' primero."
-- Formato: bloque de código SQL.
+### ATHENA
+El usuario quiere datos reales de una tabla, un conteo, un sample, o que le escribas/ejecutes una query SQL.
+- Llama primero a `get_dataset_schema` si el schema no está en el contexto — te dará columnas y la database de Glue/Athena.
+- Construye la SELECT apropiada usando el nombre exacto de tabla y columnas del schema.
+- Si el usuario quiere los datos (no solo la query): llama a `run_athena_query` directamente con la query. No pidas confirmación.
+- Si el usuario solo quiere la query escrita (sin ejecutar): devuelve solo el bloque SQL con un comentario encima explicando qué hace.
+- Si ejecutas la query y devuelves resultados: incluye siempre el bloque SQL ejecutado antes de los resultados.
+- Usa LIMIT cuando el usuario no especifique cantidad. COUNT(*) para conteos.
+- **CRÍTICO**: NUNCA escribas frases como "Ejecuto la query:", "Llamo a la herramienta:", "Ejecuto ahora:" sin incluir inmediatamente el tool call correspondiente en el mismo turno. Si quieres ejecutar una query, HAZLO (llama al tool). No anuncies acciones que no ejecutas en ese mismo mensaje. Si ya tienes los resultados del tool en el contexto, preséntalo directamente sin anunciar que "vas a ejecutar".
 
 ### GENERAL
 - Responde solo con información presente en el contexto.
@@ -112,10 +116,12 @@ Si no es claro, responde como GENERAL.
 Tienes herramientas disponibles. Úsalas de forma proactiva cuando el contexto no sea suficiente:
 
 - **`get_job_code`**: si el contexto dice `Código fuente disponible: xxx.py`, llámala automáticamente. No pidas al usuario que pregunte de nuevo.
-- **`get_dataset_schema`**: si preguntan por columnas/estructura de una tabla y no está en el contexto.
+- **`get_dataset_schema`**: el schema **nunca** está pre-cargado en el contexto — llámala siempre que el usuario pregunte por columnas/estructura de una tabla. También es obligatoria antes de `run_athena_query` para obtener la database y los nombres exactos de columnas.
+- **`get_column_lineage`**: el linaje de columnas **nunca** está pre-cargado — llámala para preguntas como "¿de dónde viene la columna X?", "¿qué campos alimentan Y?", "¿cómo se calcula Z?". Acepta `field_name` opcional para filtrar por campo concreto. Más ligera que `get_dataset_schema`.
 - **`search_by_field`**: si preguntan por un campo/columna concreto ("¿dónde está X?", "¿qué tablas tienen Y?"). Más fiable que el contexto semántico para nombres de columnas.
 - **`get_downstream_impact`**: si preguntan qué se rompe o qué depende de un dataset. Devuelve el árbol exacto del grafo.
 - **`find_jobs_by_dataset`**: si preguntan quién produce o consume un dataset concreto.
+- **`run_athena_query`**: si el usuario pide datos reales, conteos, samples o que ejecutes una query. Construye la SELECT, enseñasela y ejecútala pidiendo confirmación. Solo SELECT — nunca DDL ni DML.
 
 ## Reglas globales
 - No inventes información.
@@ -144,7 +150,9 @@ def _is_list_query(question: str) -> bool:
 
 
 def _detect_filters(
-    question: str, collection: chromadb.Collection
+    question: str,
+    collection: chromadb.Collection,
+    filter_terms: dict | None = None,
 ) -> tuple[str | None, str | None]:
     """Detecta namespace y/o nombre de dataset mencionados en la pregunta.
 
@@ -152,12 +160,15 @@ def _detect_filters(
     para capturar referencias parciales. Prioriza términos más largos (más específicos).
     """
     try:
-        all_metas = collection.get(include=["metadatas"])["metadatas"] or []
+        if filter_terms:
+            namespaces = filter_terms["namespaces"]
+            names = filter_terms["names"]
+        else:
+            all_metas = collection.get(include=["metadatas"])["metadatas"] or []
+            namespaces = {str(v) for m in all_metas if (v := m.get("namespace"))}
+            names = {str(v) for m in all_metas if (v := m.get("name"))}
         q = question.lower()
         q_tokens = set(re.split(r"[\s_\-/]+", q))
-
-        namespaces = {str(v) for m in all_metas if (v := m.get("namespace"))}
-        names = {str(v) for m in all_metas if (v := m.get("name"))}
 
         def matches(term: str) -> bool:
             tl = term.lower()
@@ -206,7 +217,7 @@ def _rerank_docs(
     """Filter and reorder retrieved docs by relevance using Claude Haiku."""
     if len(docs) <= top_k:
         return docs
-    numbered = "\n\n".join(f"[{i}] {doc[:400]}" for i, doc in enumerate(docs))
+    numbered = "\n\n".join(f"[{i}] {doc[:600]}" for i, doc in enumerate(docs))
     prompt = (
         f"Pregunta: {question}\n\n"
         f"Fragmentos de contexto:\n{numbered}\n\n"
@@ -296,26 +307,30 @@ def _graph_context(G: nx.DiGraph, question: str) -> str:
                 lines.append(f"\nCódigo fuente ({node.get('name', '?')}.py):\n```python\n{node['glue_code'].strip()}\n```")
             else:
                 lines.append(f"\nCódigo fuente disponible: {node.get('name', '?')}.py")
+        elif node.get("glue_code_s3_key"):
+            lines.append(f"\nCódigo fuente disponible: {node.get('name', '?')}.py")
 
         lines.append(f"\nInputs ({len(inputs)}):")
         for _, ds in inputs:
             lines.append(f"  - {ds.get('name', '?')} [{ds.get('namespace', '?')}]")
-            if ds.get("schema"):
-                lines.append(f"    Schema: {', '.join(ds['schema'])}")
-            if ds.get("column_lineage"):
-                for out_field, srcs in ds["column_lineage"].items():
-                    src_str = ", ".join(f"{s['table']}.{s['field']}" for s in srcs)
-                    lines.append(f"    {out_field} ← {src_str}")
+            # schema/column_lineage omitidos — lazy-load via get_dataset_schema tool
+            # if ds.get("schema"):
+            #     lines.append(f"    Schema: {', '.join(ds['schema'])}")
+            # if ds.get("column_lineage"):
+            #     for out_field, srcs in ds["column_lineage"].items():
+            #         src_str = ", ".join(f"{s['table']}.{s['field']}" for s in srcs)
+            #         lines.append(f"    {out_field} ← {src_str}")
 
         lines.append(f"\nOutputs ({len(outputs)}):")
         for _, ds in outputs:
             lines.append(f"  - {ds.get('name', '?')} [{ds.get('namespace', '?')}]")
-            if ds.get("schema"):
-                lines.append(f"    Schema: {', '.join(ds['schema'])}")
-            if ds.get("column_lineage"):
-                for out_field, srcs in ds["column_lineage"].items():
-                    src_str = ", ".join(f"{s['table']}.{s['field']}" for s in srcs)
-                    lines.append(f"    {out_field} ← {src_str}")
+            # schema/column_lineage omitidos — lazy-load via get_dataset_schema tool
+            # if ds.get("schema"):
+            #     lines.append(f"    Schema: {', '.join(ds['schema'])}")
+            # if ds.get("column_lineage"):
+            #     for out_field, srcs in ds["column_lineage"].items():
+            #         src_str = ", ".join(f"{s['table']}.{s['field']}" for s in srcs)
+            #         lines.append(f"    {out_field} ← {src_str}")
 
     elif match_kind == "dataset":
         producers = [(src, G.nodes[src]) for src in G.predecessors(match_key) if G.nodes[src].get("kind") == "job"]
@@ -324,13 +339,14 @@ def _graph_context(G: nx.DiGraph, question: str) -> str:
         lines.append(f"Dataset: {node.get('name', '?')}")
         lines.append(f"Namespace: {node.get('namespace', '?')}")
         lines.append(f"Formato: {node.get('format', '?')}")
-        if node.get("schema"):
-            lines.append(f"Schema: {', '.join(node['schema'])}")
-        if node.get("column_lineage"):
-            lines.append("Linaje de columnas:")
-            for out_field, srcs in node["column_lineage"].items():
-                src_str = ", ".join(f"{s['table']}.{s['field']} [{s['type']}/{s['subtype']}]" for s in srcs)
-                lines.append(f"  {out_field} ← {src_str}")
+        # schema/column_lineage omitidos — lazy-load via get_dataset_schema tool
+        # if node.get("schema"):
+        #     lines.append(f"Schema: {', '.join(node['schema'])}")
+        # if node.get("column_lineage"):
+        #     lines.append("Linaje de columnas:")
+        #     for out_field, srcs in node["column_lineage"].items():
+        #         src_str = ", ".join(f"{s['table']}.{s['field']} [{s['type']}/{s['subtype']}]" for s in srcs)
+        #         lines.append(f"  {out_field} ← {src_str}")
         if producers:
             lines.append(f"Producido por: {', '.join(d.get('name', k) for k, d in producers)}")
         if consumers:
@@ -349,6 +365,7 @@ def ask(
     G: nx.DiGraph | None = None,
     bucket: str | None = None,
     jobs_prefix: str = "glue/code/jobs/",
+    filter_terms: dict | None = None,
 ) -> str:
     if not os.getenv("ANTHROPIC_API_KEY"):
         return "[ERROR] ANTHROPIC_API_KEY environment variable is missing."
@@ -360,32 +377,33 @@ def ask(
     if _is_list_query(question):
         n_results = max(n_results, 40)
 
-    # 2. Build search_query from recent history (user messages + assistant snippets)
+    seen_ids: set[str] = set()
+    docs: list[str] = []
+    graph_doc: str = ""
+
+    # 2. Direct graph lookup first — skip Haiku rewrite when exact match found
+    if G is not None:
+        graph_doc = _graph_context(G, question)
+        if graph_doc:
+            docs.append(graph_doc)
+            seen_ids.add(graph_doc[:40])
+
+    # 3. Build search query — rewrite with Haiku only when no exact graph match
     recent_context = [
         (m["content"] if m["role"] == "user" else m["content"][:200])
         for m in history[-6:]
         if m["role"] in ("user", "assistant")
     ]
     raw_query = " ".join(recent_context[-4:] + [question])
+    if not graph_doc:
+        search_query = _rewrite_query(question, history, client)
+        print(f"[debug] Rewritten search query: {search_query}")
+        search_query = f"{raw_query} {search_query}"
+    else:
+        search_query = raw_query
 
-    # 3. Rewrite query with Haiku to improve semantic retrieval
-    search_query = _rewrite_query(question, history, client)
-    # Combine rewritten query + historical context for the embedding
-    search_query = f"{raw_query} {search_query}"
-
-    seen_ids: set[str] = set()
-    docs: list[str] = []
-    graph_doc: str = ""
-
-    # 4a. Direct graph lookup - if the question mentions a specific job/dataset
-    if G is not None:
-        graph_doc = _graph_context(G, question)
-        if graph_doc:
-            docs.insert(0, graph_doc)
-            seen_ids.add(graph_doc[:40])
-
-    # 4b. General semantic search (more candidates for reranking)
-    fetch_n = min(n_results * 2, 40)
+    # 4b. General semantic search — fewer candidates needed when graph already found the node
+    fetch_n = min(n_results, 10) if graph_doc else min(n_results, 20)
     results = collection.query(query_texts=[f"query: {search_query}"], n_results=fetch_n)
     for doc, meta in zip(
         results.get("documents", [[]])[0],
@@ -396,7 +414,7 @@ def ask(
             seen_ids.add(key)
             docs.append(doc)
 
-    ns, name = _detect_filters(search_query, collection)
+    ns, name = _detect_filters(search_query, collection, filter_terms)
 
     # Exact dataset match -> prioritize at the top of context
     if name and name not in seen_ids:
@@ -426,23 +444,44 @@ def ask(
         if len(ns_lines) > 1:
             docs.append("\n\n".join(ns_lines))
 
+    # Knowledge guarantee: always fetch top-3 knowledge chunks so they enter the reranker pool
+    # even when lineage docs dominate the semantic search results.
+    k_results = collection.query(
+        query_texts=[f"query: {search_query}"],
+        n_results=3,
+        where={"kind": "knowledge"},
+    )
+    for doc, meta in zip(
+        k_results.get("documents", [[]])[0],
+        k_results.get("metadatas", [[]])[0],
+    ):
+        key = meta.get("name", doc[:40])
+        if key not in seen_ids:
+            seen_ids.add(key)
+            docs.append(doc)
+
     if not docs:
         return "No relevant information found in the lineage index. Run 'sync' first."
 
     # 5. Reranking: filter to the most relevant docs with Haiku
-    # graph_doc is always kept (exact node match) - never passed through reranker
+    # graph_doc and exact name match are pinned — never passed through reranker
     n_priority = 1 if graph_doc and docs and docs[0] == graph_doc else 0
     n_priority += 1 if name and len(docs) > n_priority else 0
+    top_k = min(max(n_results - n_priority, 3), 5)
     priority = docs[:n_priority]
     rest = docs[n_priority:]
-    reranked_rest = _rerank_docs(question, rest, client, top_k=max(n_results - n_priority, 4))
-    docs = priority + reranked_rest
+    # Skip rerank entirely when priority docs already fill or exceed the context budget
+    if n_priority >= top_k or not rest:
+        docs = priority
+    else:
+        docs = priority + _rerank_docs(question, rest, client, top_k=top_k)
 
     context = "\n\n---\n\n".join(docs)
+    print(f"[context] {len(context)} chars, {len(docs)} docs")
 
-    # 6. Build messages for Sonnet with history + RAG context
+    # 6. Build messages for Sonnet with history + RAG context — cap history to last 4 turns
     api_messages: list[dict] = []
-    for msg in history:
+    for msg in history[-4:]:
         api_messages.append({"role": msg["role"], "content": msg["content"]})
 
     api_messages.append(
@@ -465,10 +504,11 @@ def ask(
     system_block = [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}]
 
     response = None
-    for _ in range(4):  # max tool-use roundtrips
+    intermediate_texts: list[str] = []
+    for _ in range(4):
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=4096,
+            max_tokens=8192,
             system=system_block,
             tools=_TOOLS,
             messages=api_messages,
@@ -476,6 +516,11 @@ def ask(
 
         if response.stop_reason != "tool_use":
             break
+
+        # Capture any text blocks from intermediate tool_use responses
+        for b in response.content:
+            if b.type == "text" and b.text.strip():
+                intermediate_texts.append(b.text.strip())
 
         # Append assistant turn and execute each tool call
         api_messages.append({"role": "assistant", "content": response.content})
@@ -493,8 +538,14 @@ def ask(
 
     if response is None:
         return ""
-    block = next((b for b in response.content if b.type == "text"), None)
-    return block.text if block else ""
+    final_block = next((b for b in response.content if b.type == "text"), None)
+    final_text = final_block.text.strip() if final_block else ""
+    # If the final turn is empty but intermediate turns had text, surface the last
+    # meaningful intermediate (e.g. Claude announced a tool call but produced no
+    # follow-up text after execution). This avoids silent empty responses.
+    if not final_text and intermediate_texts:
+        return intermediate_texts[-1]
+    return final_text
 
 
 # ── Análisis de impacto (grafo puro, sin LLM) ─────────────────────────────────
@@ -538,15 +589,16 @@ def sync(
     jobs_prefix: str = "glue/code/jobs/",
 ) -> tuple[nx.DiGraph, chromadb.Collection]:
     job_code: dict[str, str] = {}
+    job_keys: dict[str, str] = {}
 
     if bucket:
         print(f"[sync] Loading events from s3://{bucket}/{events_prefix} ...")
         events = load_events_s3(bucket, events_prefix)
         print(f"[sync] {len(events)} events loaded from S3")
         if jobs_prefix:
-            print(f"[sync] Loading job code from s3://{bucket}/{jobs_prefix} ...")
-            job_code = load_job_code_s3(bucket, jobs_prefix)
-            print(f"[sync] {len(job_code)} .py files loaded from S3")
+            print(f"[sync] Listing job keys from s3://{bucket}/{jobs_prefix} ...")
+            job_keys = list_job_keys_s3(bucket, jobs_prefix)
+            print(f"[sync] {len(job_keys)} .py files found in S3 (no download)")
     else:
         print(f"[sync] Loading events from {events_path} ...")
         events = load_events(events_path)
@@ -558,7 +610,9 @@ def sync(
         print(f"[sync] {len(events)} events loaded")
 
     G = build_graph(events)
-    if job_code:
+    if job_keys:
+        enrich_graph_with_code_keys(G, job_keys)
+    elif job_code:
         from rag.ingest import enrich_graph_with_code
         enrich_graph_with_code(G, job_code)
 
