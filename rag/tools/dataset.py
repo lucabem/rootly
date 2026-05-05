@@ -1,6 +1,44 @@
 from __future__ import annotations
 
+import os
+
 import networkx as nx
+
+
+def _schema_from_glue(dataset_name: str, database: str) -> str | None:
+    """Try to fetch table schema from AWS Glue Data Catalog. Returns None on any error."""
+    try:
+        import boto3
+
+        client = boto3.client("glue")
+        resp = client.get_table(DatabaseName=database, Name=dataset_name)
+        table = resp["Table"]
+        sd = table.get("StorageDescriptor", {})
+        columns = sd.get("Columns", [])
+        partitions = table.get("PartitionKeys", [])
+
+        if not columns and not partitions:
+            return None
+
+        lines = [f"Schema de {table['Name']} [{database}] (via Glue):"]
+        for col in columns:
+            comment = f"  # {col['Comment']}" if col.get("Comment") else ""
+            lines.append(f"  - {col['Name']} ({col['Type']}){comment}")
+        if partitions:
+            lines.append("  Partition keys:")
+            for col in partitions:
+                lines.append(f"    - {col['Name']} ({col['Type']})")
+        return "\n".join(lines)
+    except Exception:
+        return None
+
+
+def _glue_database(namespace: str) -> str:
+    """Resolve which Glue database to query: namespace hint → env vars → 'default'."""
+    # If namespace looks like a plain name (not a URL), use it directly.
+    if namespace and "://" not in namespace and "/" not in namespace:
+        return namespace
+    return os.environ.get("GLUE_DATABASE") or os.environ.get("ATHENA_DATABASE", "default")
 
 SCHEMAS = [
     {
@@ -63,6 +101,34 @@ SCHEMAS = [
                 "namespace": {
                     "type": "string",
                     "description": "Namespace del dataset (opcional, para desambiguar)",
+                },
+            },
+            "required": ["dataset_name"],
+        },
+    },
+    {
+        "name": "get_column_lineage",
+        "description": (
+            "Devuelve el linaje de columnas de un dataset: para cada campo de salida, "
+            "qué campos de entrada lo originan y el tipo de transformación. "
+            "Úsalo para preguntas como '¿de dónde viene la columna X?', "
+            "'¿qué campos alimentan Y?', '¿cómo se calcula Z?'. "
+            "Más ligero que get_dataset_schema — no devuelve el schema completo."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dataset_name": {
+                    "type": "string",
+                    "description": "Nombre del dataset",
+                },
+                "namespace": {
+                    "type": "string",
+                    "description": "Namespace del dataset (opcional, para desambiguar)",
+                },
+                "field_name": {
+                    "type": "string",
+                    "description": "Filtrar por campo concreto (opcional)",
                 },
             },
             "required": ["dataset_name"],
@@ -141,7 +207,10 @@ def handle_schema(inputs: dict, G: nx.DiGraph | None, bucket: str | None, jobs_p
             schema = data.get("schema", [])
             col_lineage = data.get("column_lineage", {})
             if not schema and not col_lineage:
-                return f"Dataset '{data['name']}' encontrado pero sin schema disponible en el índice."
+                glue_result = _schema_from_glue(data["name"], _glue_database(data.get("namespace", namespace)))
+                if glue_result:
+                    return glue_result
+                return f"Dataset '{data['name']}' encontrado pero sin schema disponible en el índice ni en Glue."
             lines = [f"Schema de {data['name']} [{data.get('namespace', '')}]:"]
             for col in schema:
                 lines.append(f"  - {col}")
@@ -151,7 +220,47 @@ def handle_schema(inputs: dict, G: nx.DiGraph | None, bucket: str | None, jobs_p
                     src_str = ", ".join(f"{s['table']}.{s['field']}" for s in sources)
                     lines.append(f"  {field} ← {src_str}")
             return "\n".join(lines)
-    return f"No se encontró el dataset '{dataset_name}' en el índice. Ejecuta sync primero."
+
+    glue_result = _schema_from_glue(dataset_name, _glue_database(namespace))
+    if glue_result:
+        return glue_result
+    return f"No se encontró el dataset '{dataset_name}' en el índice ni en Glue. Ejecuta sync primero."
+
+
+def handle_column_lineage(inputs: dict, G: nx.DiGraph | None, bucket: str | None, jobs_prefix: str) -> str:
+    dataset_name = inputs.get("dataset_name", "").strip().lower()
+    namespace = inputs.get("namespace", "").strip().lower()
+    field_filter = inputs.get("field_name", "").strip().lower()
+    if not G or not dataset_name:
+        return "Parámetro dataset_name requerido."
+
+    for _, data in G.nodes(data=True):
+        if data.get("kind") != "dataset":
+            continue
+        if dataset_name not in data.get("name", "").lower():
+            continue
+        if namespace and namespace not in data.get("namespace", "").lower():
+            continue
+
+        col_lineage = data.get("column_lineage", {})
+        if not col_lineage:
+            return f"Dataset '{data['name']}' encontrado pero sin linaje de columnas disponible."
+
+        lines = [f"Linaje de columnas de {data['name']} [{data.get('namespace', '')}]:"]
+        for field, sources in col_lineage.items():
+            if field_filter and field_filter not in field.lower():
+                continue
+            src_str = ", ".join(
+                f"{s['table']}.{s['field']} [{s.get('type', '?')}/{s.get('subtype', '?')}]"
+                for s in sources
+            )
+            lines.append(f"  {field} ← {src_str}")
+
+        if len(lines) == 1:
+            return f"No se encontró linaje para el campo '{field_filter}' en '{data['name']}'."
+        return "\n".join(lines)
+
+    return f"Dataset '{dataset_name}' no encontrado en el grafo."
 
 
 def handle_search_field(inputs: dict, G: nx.DiGraph | None, bucket: str | None, jobs_prefix: str) -> str:

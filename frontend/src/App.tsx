@@ -4,6 +4,43 @@ import remarkGfm from 'remark-gfm'
 import { Autocomplete } from './components/Autocomplete'
 import { GraphView } from './components/GraphView'
 
+const SUGGESTIONS = [
+  '¿Qué datasets existen en producción?',
+  '¿Qué jobs producen el dataset contratos?',
+  '¿Qué se rompe si cambio el schema de orders?',
+  '¿De dónde viene la columna id_cliente?',
+]
+
+const LOADING_HINTS = [
+  'Consultando el grafo de linaje…',
+  'Buscando en el índice semántico…',
+  'Ejecutando herramienta…',
+  'Generando respuesta…',
+]
+
+function CodeBlock({ children }: { children: React.ReactNode }) {
+  const [copied, setCopied] = useState(false)
+  const text = (() => {
+    const child = (children as any)?.[0]
+    return child?.props?.children ?? ''
+  })()
+  return (
+    <div className="code-block-wrapper">
+      <button
+        className={`copy-btn${copied ? ' copied' : ''}`}
+        onClick={() => {
+          navigator.clipboard.writeText(String(text).trimEnd())
+          setCopied(true)
+          setTimeout(() => setCopied(false), 2000)
+        }}
+      >
+        {copied ? '✓ copiado' : 'copiar'}
+      </button>
+      <pre>{children}</pre>
+    </div>
+  )
+}
+
 type Role = 'user' | 'assistant'
 type Tab = 'chat' | 'impact' | 'graph' | 'tasks'
 type TaskStatus = 'PENDING' | 'STARTED' | 'SUCCESS' | 'FAILURE'
@@ -80,6 +117,7 @@ export default function App() {
   const [allDatasets, setAllDatasets] = useState<DatasetEntry[]>([])
   const [allNamespaces, setAllNamespaces] = useState<string[]>([])
   const [tasks, setTasks] = useState<TaskEntry[]>(loadTasks)
+  const [loadingHint, setLoadingHint] = useState(0)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   const MAX_TASK_AGE_MS = 24 * 60 * 60 * 1000
@@ -100,6 +138,13 @@ export default function App() {
     const t = setTimeout(() => setToast(null), 3500)
     return () => clearTimeout(t)
   }, [toast])
+
+  // Cycle loading hint text while waiting for response
+  useEffect(() => {
+    if (!loading) { setLoadingHint(0); return }
+    const t = setInterval(() => setLoadingHint(h => (h + 1) % LOADING_HINTS.length), 3000)
+    return () => clearInterval(t)
+  }, [loading])
 
   // Persist tasks
   useEffect(() => { saveTasks(tasks) }, [tasks])
@@ -171,14 +216,12 @@ export default function App() {
     }
   }
 
-  async function sendMessage() {
-    const q = input.trim()
+  async function sendQuestion(q: string) {
     if (!q || loading) return
-    setInput('')
     setMessages(prev => [...prev, { id: ++msgId, role: 'user', content: q }])
     setLoading(true)
     try {
-      const history = messages.map(m => ({ role: m.role, content: m.content }))
+      const history = messages.slice(-10).map(m => ({ role: m.role, content: m.content }))
       const r = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -193,6 +236,27 @@ export default function App() {
     } finally {
       setLoading(false)
     }
+  }
+
+  async function sendMessage() {
+    const q = input.trim()
+    if (!q) return
+    setInput('')
+    await sendQuestion(q)
+  }
+
+  function handleAskAboutNode(node: { kind: string; name: string; namespace: string; field?: string }) {
+    setTab('chat')
+    const ns = node.namespace ? ` (${node.namespace})` : ''
+    let q: string
+    if (node.field) {
+      q = `Cuéntame sobre la columna "${node.field}" del dataset "${node.name}"${ns}: de dónde viene, qué transformaciones sufre y qué jobs la producen o modifican.`
+    } else if (node.kind === 'job') {
+      q = `Cuéntame sobre el job ETL "${node.name}": qué datasets lee y escribe, cuál es su lógica y su historial de ejecuciones recientes.`
+    } else {
+      q = `Cuéntame sobre el dataset "${node.name}"${ns}: su schema, los jobs que lo producen y consumen, y si tiene linaje de columnas disponible.`
+    }
+    sendQuestion(q)
   }
 
   async function handleSync() {
@@ -308,6 +372,13 @@ export default function App() {
                   </div>
                   <h3>Consulta tu linaje de datos</h3>
                   <p>Pregunta sobre datasets, pipelines, impacto de cambios de schema y más.</p>
+                  <div className="suggestions">
+                    {SUGGESTIONS.map(s => (
+                      <button key={s} className="suggestion-chip" onClick={() => setInput(s)}>
+                        {s}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               )}
               {messages.map(msg => (
@@ -315,7 +386,14 @@ export default function App() {
                   <span className="message-label">{msg.role === 'user' ? 'Tú' : 'Asistente'}</span>
                   <div className="bubble">
                     {msg.role === 'assistant'
-                      ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+                      ? (
+                        <ReactMarkdown
+                          remarkPlugins={[remarkGfm]}
+                          components={{ pre: ({ children }) => <CodeBlock>{children}</CodeBlock> }}
+                        >
+                          {msg.content}
+                        </ReactMarkdown>
+                      )
                       : msg.content}
                   </div>
                 </div>
@@ -323,7 +401,12 @@ export default function App() {
               {loading && (
                 <div className="message assistant">
                   <span className="message-label">Asistente</span>
-                  <div className="bubble"><div className="typing"><span /><span /><span /></div></div>
+                  <div className="bubble">
+                    <div className="typing">
+                      <span /><span /><span />
+                      <span className="loading-hint">{LOADING_HINTS[loadingHint]}</span>
+                    </div>
+                  </div>
                 </div>
               )}
               <div ref={messagesEndRef} />
@@ -331,7 +414,13 @@ export default function App() {
             <div className="input-bar">
               <textarea rows={1} value={input} onChange={e => setInput(e.target.value)}
                 onKeyDown={handleChatKey} placeholder="¿Qué pipelines fallarían si cambio el schema de orders?"
-                disabled={loading} style={{ minHeight: '42px', maxHeight: '120px' }} />
+                disabled={loading}
+                style={{ minHeight: '42px', maxHeight: '120px' }}
+                onInput={e => {
+                  const el = e.currentTarget
+                  el.style.height = 'auto'
+                  el.style.height = `${Math.min(el.scrollHeight, 120)}px`
+                }} />
               <button className="send-btn" onClick={sendMessage} disabled={loading || !input.trim()}>Enviar</button>
             </div>
           </>
@@ -398,7 +487,7 @@ export default function App() {
         {/* ── Grafo ── */}
         {tab === 'graph' && (
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-            <GraphView />
+            <GraphView onAskAboutNode={handleAskAboutNode} />
           </div>
         )}
 

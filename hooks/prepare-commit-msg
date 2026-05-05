@@ -10,6 +10,11 @@ case "$COMMIT_SOURCE" in
     merge|squash|commit) exit 0 ;;
 esac
 
+# Load .env from project root if key not already in environment
+if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+    ENV_FILE="$(cd "$(dirname "$0")/.." && pwd)/.env"
+    [ -f "$ENV_FILE" ] && set -a && source "$ENV_FILE" && set +a
+fi
 [ -z "${ANTHROPIC_API_KEY:-}" ] && exit 0
 
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"

@@ -176,13 +176,6 @@ def _serialize_job(G: nx.DiGraph, key: str, node: dict, job_code: dict) -> str:
     n_fail = sum(1 for r in runs if r["type"] == "FAIL")
     last_run = runs[-1] if runs else None
 
-    # Glue code: from the node (enriched by enrich_graph_with_code) or direct dict lookup
-    glue_code = (
-        node.get("glue_code")
-        or job_code.get(name)
-        or next((code for fname, code in job_code.items() if fname in name), None)
-    )
-
     lines = [
         f"Job (ETL pipeline): {name}",
         f"Namespace: {ns}",
@@ -193,8 +186,8 @@ def _serialize_job(G: nx.DiGraph, key: str, node: dict, job_code: dict) -> str:
     if last_run:
         lines.append(f"Last event: {last_run['type']} at {last_run['ts']}")
 
-    if glue_code:
-        lines.append(f"Glue source code:\n{glue_code}")
+    if node.get("glue_code_s3_key"):
+        lines.append(f"Glue source code available: {os.path.basename(node['glue_code_s3_key'])}")
 
     return "\n".join(lines)
 

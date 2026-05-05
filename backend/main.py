@@ -43,7 +43,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_state: dict = {"G": None, "collection": None, "loaded_at": 0.0}
+_state: dict = {"G": None, "collection": None, "loaded_at": 0.0, "filter_terms": None, "datasets_resp": None}
 _load_lock = threading.Lock()
 _last_reloaded_task: str | None = None
 
@@ -73,6 +73,22 @@ def _ensure_loaded():
             G = build_graph(events)
 
         _state.update({"G": G, "collection": collection, "loaded_at": time.time()})
+
+        all_metas = collection.get(include=["metadatas"])["metadatas"] or []
+        _state["filter_terms"] = {
+            "namespaces": {str(v) for m in all_metas if (v := m.get("namespace"))},
+            "names": {str(v) for m in all_metas if (v := m.get("name"))},
+        }
+
+        datasets = [
+            {"key": k, "namespace": d.get("namespace", ""), "name": d.get("name", k)}
+            for k, d in G.nodes(data=True)
+            if d.get("kind") == "dataset"
+        ]
+        _state["datasets_resp"] = {
+            "datasets": datasets,
+            "namespaces": sorted({d["namespace"] for d in datasets if d["namespace"]}),
+        }
 
     return _state["G"], _state["collection"]
 
@@ -146,6 +162,7 @@ def chat(req: ChatRequest):
             G=_state["G"],
             bucket=S3_BUCKET,
             jobs_prefix=S3_JOBS_PREFIX,
+            filter_terms=_state.get("filter_terms"),
         )
         _save_chat(req.question, answer)
         return {"answer": answer}
@@ -161,6 +178,8 @@ def chat(req: ChatRequest):
 
 @app.get("/api/datasets")
 def list_datasets():
+    if _state.get("datasets_resp"):
+        return _state["datasets_resp"]
     try:
         G = _state["G"]
         datasets = []
@@ -254,6 +273,8 @@ def task_status(task_id: str):
                     _state["G"] = None
                     _state["collection"] = None
                     _state["loaded_at"] = 0.0
+                    _state["filter_terms"] = None
+                    _state["datasets_resp"] = None
                     should_reload = True
             else:
                 print(f"[task_status] task={task_id} SUCCESS (already processed) — skipping reload.")
