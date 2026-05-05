@@ -8,6 +8,7 @@ Each graph node produces one document. Additionally, for each source dataset
 describing transitive downstream dependencies.
 """
 
+import json
 import os
 
 import chromadb
@@ -16,9 +17,31 @@ from rag.knowledge import index_knowledge
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
 CHROMA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".chroma")
+GRAPH_CACHE_PATH = os.path.join(CHROMA_DIR, "graph_cache.json")
 
 # PRO -> intfloat/multilingual-e5-large
 _EMBEDDING_FN = SentenceTransformerEmbeddingFunction(model_name="intfloat/multilingual-e5-large")
+
+
+def save_graph_cache(G: nx.DiGraph, path: str = GRAPH_CACHE_PATH) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(nx.node_link_data(G), f)
+    print(f"[graph_cache] Saved {G.number_of_nodes()} nodes → {path}")
+
+
+def load_graph_cache(path: str = GRAPH_CACHE_PATH) -> nx.DiGraph | None:
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        G = nx.node_link_graph(data)
+        print(f"[graph_cache] Loaded {G.number_of_nodes()} nodes from {path}")
+        return G
+    except Exception as e:
+        print(f"[graph_cache] Failed to load: {e}")
+        return None
 
 
 def get_collection(persist_dir: str = CHROMA_DIR) -> chromadb.Collection:
@@ -153,13 +176,6 @@ def _serialize_job(G: nx.DiGraph, key: str, node: dict, job_code: dict) -> str:
     n_fail = sum(1 for r in runs if r["type"] == "FAIL")
     last_run = runs[-1] if runs else None
 
-    # Glue code: from the node (enriched by enrich_graph_with_code) or direct dict lookup
-    glue_code = (
-        node.get("glue_code")
-        or job_code.get(name)
-        or next((code for fname, code in job_code.items() if fname in name), None)
-    )
-
     lines = [
         f"Job (ETL pipeline): {name}",
         f"Namespace: {ns}",
@@ -170,8 +186,8 @@ def _serialize_job(G: nx.DiGraph, key: str, node: dict, job_code: dict) -> str:
     if last_run:
         lines.append(f"Last event: {last_run['type']} at {last_run['ts']}")
 
-    if glue_code:
-        lines.append(f"Glue source code:\n{glue_code}")
+    if node.get("glue_code_s3_key"):
+        lines.append(f"Glue source code available: {os.path.basename(node['glue_code_s3_key'])}")
 
     return "\n".join(lines)
 

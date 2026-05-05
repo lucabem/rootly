@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Generates a commit message and CHANGELOG.md entry via Claude Haiku before each commit.
+# Skips silently on merges, squashes, amends, and when ANTHROPIC_API_KEY is not set.
+set -euo pipefail
+
+COMMIT_MSG_FILE="$1"
+COMMIT_SOURCE="${2:-}"
+
+case "$COMMIT_SOURCE" in
+    merge|squash|commit) exit 0 ;;
+esac
+
+# Load .env from project root if key not already in environment
+if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+    ENV_FILE="$(cd "$(dirname "$0")/.." && pwd)/.env"
+    [ -f "$ENV_FILE" ] && set -a && source "$ENV_FILE" && set +a
+fi
+[ -z "${ANTHROPIC_API_KEY:-}" ] && exit 0
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$HOOK_DIR/.." && pwd)"
+
+python3 "$HOOK_DIR/generate_commit_message.py" \
+    "$COMMIT_MSG_FILE" \
+    "$COMMIT_SOURCE" \
+    "$PROJECT_ROOT"

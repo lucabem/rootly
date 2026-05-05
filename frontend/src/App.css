@@ -57,11 +57,13 @@ body {
   color: var(--text);
 }
 
-.header-title .dot {
-  width: 8px;
-  height: 8px;
+.header-logo {
+  width: 28px;
+  height: 28px;
   border-radius: 50%;
-  background: var(--accent);
+  object-fit: cover;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
 }
 
 .header-stats {
@@ -198,6 +200,15 @@ body {
   opacity: 0.4;
 }
 
+.empty-logo {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 2px solid var(--border);
+  opacity: 0.85;
+}
+
 .empty-state h3 {
   font-size: 16px;
   font-weight: 500;
@@ -292,12 +303,13 @@ body {
   padding: 10px 14px;
 }
 
-.typing span {
+.typing span:not(.loading-hint) {
   width: 6px;
   height: 6px;
   background: var(--text-muted);
   border-radius: 50%;
   animation: bounce 1.2s infinite;
+  flex-shrink: 0;
 }
 
 .typing span:nth-child(2) { animation-delay: 0.2s; }
@@ -826,4 +838,97 @@ body {
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(10px); }
   to { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Markdown tables ── */
+.bubble table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 12px;
+}
+.bubble th, .bubble td {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+.bubble th {
+  background: var(--surface2);
+  font-weight: 600;
+  color: var(--text);
+}
+.bubble tr:nth-child(even) td {
+  background: rgba(255,255,255,0.02);
+}
+
+/* ── Code block with copy button ── */
+.code-block-wrapper {
+  position: relative;
+  margin: 8px 0;
+}
+.copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s;
+  z-index: 1;
+  font-family: inherit;
+}
+.copy-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.copy-btn.copied {
+  border-color: var(--success);
+  color: var(--success);
+}
+.code-block-wrapper pre {
+  margin: 0;
+}
+
+/* ── Suggestion chips ── */
+.suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 12px;
+  max-width: 480px;
+}
+.suggestion-chip {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  border-radius: 20px;
+  padding: 6px 14px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+  font-family: inherit;
+  text-align: left;
+}
+.suggestion-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+
+/* ── Loading hint text ── */
+.loading-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-left: 10px;
+  opacity: 0.8;
+  font-style: italic;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }

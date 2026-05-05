@@ -105,6 +105,23 @@ def load_job_code_s3(bucket: str, prefix: str = "glue/code/jobs/") -> dict[str, 
     return job_code
 
 
+def list_job_keys_s3(bucket: str, prefix: str = "glue/code/jobs/") -> dict[str, str]:
+    """List Glue .py files in S3 and return {normalized_name: s3_key}. No code downloaded."""
+    s3 = boto3.client("s3")
+    job_keys: dict[str, str] = {}
+
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if not key.endswith(".py"):
+                continue
+            job_name = os.path.basename(key).removesuffix(".py")
+            job_keys[_normalize_job_name(job_name)] = key
+
+    return job_keys
+
+
 def fetch_single_job_code_s3(bucket: str, prefix: str, job_name: str) -> str | None:
     """Fetch a single .py file from S3 matching job_name (exact, suffix, or fuzzy)."""
     s3 = boto3.client("s3")
@@ -206,6 +223,40 @@ def enrich_graph_with_code(G: nx.DiGraph, job_code: dict[str, str]) -> None:
 
     logger.info(
         "enrich_graph_with_code: %d jobs enriched, %d unmatched", matched, unmatched
+    )
+
+
+def enrich_graph_with_code_keys(G: nx.DiGraph, job_keys: dict[str, str]) -> None:
+    """Attach S3 key to each matching job node as glue_code_s3_key (no code downloaded)."""
+    matched, unmatched = 0, 0
+    for node_key, data in G.nodes(data=True):
+        if data.get("kind") != "job":
+            continue
+        norm_job = _normalize_job_name(data.get("name", ""))
+
+        s3_key = job_keys.get(norm_job)
+        if s3_key is None:
+            s3_key = next(
+                (v for k, v in job_keys.items() if norm_job.endswith(k) or k.endswith(norm_job)),
+                None,
+            )
+        if s3_key is None:
+            best_score, best_key = 0.0, None
+            for k, v in job_keys.items():
+                score = _similarity(norm_job, k)
+                if score > best_score:
+                    best_score, best_key = score, v
+            if best_score >= _SIMILARITY_THRESHOLD and best_key is not None:
+                s3_key = best_key
+
+        if s3_key:
+            G.nodes[node_key]["glue_code_s3_key"] = s3_key
+            matched += 1
+        else:
+            unmatched += 1
+
+    logger.info(
+        "enrich_graph_with_code_keys: %d jobs with S3 key, %d unmatched", matched, unmatched
     )
 
 
