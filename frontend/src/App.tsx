@@ -1,8 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { useMsal, MsalAuthenticationTemplate, useIsAuthenticated } from '@azure/msal-react'
+import { InteractionType } from '@azure/msal-browser'
 import { Autocomplete } from './components/Autocomplete'
 import { GraphView } from './components/GraphView'
+import { useAuthFetch } from './auth/useAuthFetch'
+import { loginRequest } from './auth/msalConfig'
 
 const SUGGESTIONS = [
   '¿Qué datasets existen en producción?',
@@ -102,7 +106,10 @@ function timeAgo(ts: number) {
   return `hace ${Math.floor(s / 3600)}h`
 }
 
-export default function App() {
+function AppInner() {
+  const { instance, accounts } = useMsal()
+  const authFetch = useAuthFetch()
+  const account = accounts[0]
   const [tab, setTab] = useState<Tab>('chat')
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
@@ -155,7 +162,7 @@ export default function App() {
     const interval = setInterval(async () => {
       for (const task of pendingTasks) {
         try {
-          const r = await fetch(`/api/task/${task.id}`)
+          const r = await authFetch(`/api/task/${task.id}`)
           const data = await r.json()
           if (data.status !== task.status) {
             setTasks(prev => prev.map(t =>
@@ -170,7 +177,7 @@ export default function App() {
                 : t
             ))
             if (data.status === 'SUCCESS') {
-              await fetch('/api/reload', { method: 'POST' })
+              await authFetch('/api/reload', { method: 'POST' })
               fetchStats()
               fetchDatasets()
               setToast({ msg: `Sync completado - ${data.result?.docs ?? 0} docs`, type: 'success' })
@@ -187,7 +194,7 @@ export default function App() {
 
   async function fetchHistory() {
     try {
-      const r = await fetch('/api/history?n=30')
+      const r = await authFetch('/api/history?n=30')
       const data = await r.json()
       const loaded: Message[] = (data.messages ?? []).map((m: { role: Role; content: string }) => ({
         id: ++msgId,
@@ -200,7 +207,7 @@ export default function App() {
 
   async function fetchDatasets() {
     try {
-      const r = await fetch('/api/datasets')
+      const r = await authFetch('/api/datasets')
       const data = await r.json()
       setAllDatasets(data.datasets ?? [])
       setAllNamespaces(data.namespaces ?? [])
@@ -209,7 +216,7 @@ export default function App() {
 
   async function fetchStats() {
     try {
-      const r = await fetch('/api/stats')
+      const r = await authFetch('/api/stats')
       setStats(await r.json())
     } catch {
       setStats({ datasets: 0, jobs: 0, edges: 0, indexed_docs: 0, error: 'offline' })
@@ -222,7 +229,7 @@ export default function App() {
     setLoading(true)
     try {
       const history = messages.slice(-10).map(m => ({ role: m.role, content: m.content }))
-      const r = await fetch('/api/chat', {
+      const r = await authFetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question: q, history }),
@@ -262,7 +269,7 @@ export default function App() {
   async function handleSync() {
     setSyncing(true)
     try {
-      const r = await fetch('/api/sync', { method: 'POST' })
+      const r = await authFetch('/api/sync', { method: 'POST' })
       const data = await r.json()
       if (!r.ok) throw new Error(data.detail || 'Error')
       const newTask: TaskEntry = {
@@ -286,7 +293,7 @@ export default function App() {
     setImpactLoading(true)
     setImpactResults(null)
     try {
-      const r = await fetch('/api/impact', {
+      const r = await authFetch('/api/impact', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ dataset: table, namespace: impactNamespace.trim() || null }),
@@ -317,13 +324,19 @@ export default function App() {
     </svg>
   )
 
+  const isAuthenticated = useIsAuthenticated()
+
+  // When MSAL is configured but the user hasn't finished the redirect yet,
+  // render nothing — MsalAuthenticationTemplate handles the loading/redirect.
+  if (import.meta.env.VITE_AZURE_CLIENT_ID && !isAuthenticated) return null
+
   return (
     <>
       {/* Header */}
       <header className="header">
         <div className="header-title">
           <img src="/rootly.jpeg" alt="Rootly" className="header-logo" />
-          RAG Lineage
+          Rootly
         </div>
         <div className="header-stats">
           {stats && !stats.error ? (
@@ -334,6 +347,20 @@ export default function App() {
             </>
           ) : (
             <span className="stat-badge muted">sin índice</span>
+          )}
+          {account && (
+            <>
+              <span className="stat-badge muted" title={account.username}>
+                {account.name ?? account.username}
+              </span>
+              <button
+                className="sync-btn"
+                onClick={() => instance.logoutRedirect()}
+                title="Cerrar sesión"
+              >
+                Salir
+              </button>
+            </>
           )}
           <button className={`sync-btn ${syncing ? 'spinning' : ''}`} onClick={handleSync} disabled={syncing}>
             <svg className="sync-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -555,5 +582,20 @@ export default function App() {
 
       {toast && <div className={`toast ${toast.type}`}>{toast.msg}</div>}
     </>
+  )
+}
+
+export default function App() {
+  if (!import.meta.env.VITE_AZURE_CLIENT_ID) {
+    // Dev mode: no Azure config — render directly, no auth guard
+    return <AppInner />
+  }
+  return (
+    <MsalAuthenticationTemplate
+      interactionType={InteractionType.Redirect}
+      authenticationRequest={loginRequest}
+    >
+      <AppInner />
+    </MsalAuthenticationTemplate>
   )
 }

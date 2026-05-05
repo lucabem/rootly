@@ -8,6 +8,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@azure/msal-browser": "^3.0.0",
+    "@azure/msal-react": "^2.0.0",
     "@dagrejs/dagre": "^3.0.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",

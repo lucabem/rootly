@@ -7,9 +7,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from backend.permissions import UserPermissions, get_permissions
 
 from celery.result import AsyncResult
 
@@ -128,8 +130,20 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/api/me")
+def me(perms: UserPermissions = Depends(get_permissions)):
+    return {
+        "user_id": perms.user_id,
+        "email": perms.email,
+        "is_admin": perms.is_admin,
+        "allowed_datasets": perms.allowed_datasets,
+        "allowed_namespaces": perms.allowed_namespaces,
+        "has_role_arn": perms.role_arn is not None,
+    }
+
+
 @app.get("/api/stats")
-def stats():
+def stats(perms: UserPermissions = Depends(get_permissions)):
     try:
         G, collection = _state["G"], _state["collection"]
         n_ds = sum(1 for _, d in G.nodes(data=True) if d.get("kind") == "dataset")
@@ -151,7 +165,7 @@ def stats():
 
 
 @app.post("/api/chat")
-def chat(req: ChatRequest):
+def chat(req: ChatRequest, perms: UserPermissions = Depends(get_permissions)):
     try:
         history = [{"role": m.role, "content": m.content} for m in req.history]
         answer = ask(
@@ -177,7 +191,7 @@ def chat(req: ChatRequest):
 
 
 @app.get("/api/datasets")
-def list_datasets():
+def list_datasets(perms: UserPermissions = Depends(get_permissions)):
     if _state.get("datasets_resp"):
         return _state["datasets_resp"]
     try:
@@ -199,7 +213,7 @@ def list_datasets():
 
 
 @app.post("/api/impact")
-def impact(req: ImpactRequest):
+def impact(req: ImpactRequest, perms: UserPermissions = Depends(get_permissions)):
     G = _state["G"]
     if G is None:
         raise HTTPException(status_code=503, detail="Graph not loaded yet.")
@@ -236,7 +250,7 @@ def impact(req: ImpactRequest):
 
 
 @app.post("/api/sync")
-def do_sync():
+def do_sync(perms: UserPermissions = Depends(get_permissions)):
     try:
         task = run_sync_task.delay(
             bucket=S3_BUCKET,
@@ -254,7 +268,7 @@ def do_sync():
 
 
 @app.get("/api/task/{task_id}")
-def task_status(task_id: str):
+def task_status(task_id: str, perms: UserPermissions = Depends(get_permissions)):
     global _last_reloaded_task
     result = AsyncResult(task_id, app=celery_app)
     data: dict = {"task_id": task_id, "status": result.state}
@@ -287,7 +301,7 @@ def task_status(task_id: str):
 
 
 @app.get("/api/graph")
-def graph():
+def graph(perms: UserPermissions = Depends(get_permissions)):
     G = _state["G"]
     if G is None:
         raise HTTPException(status_code=503, detail="Graph not loaded yet.")
@@ -309,7 +323,7 @@ def graph():
 
 
 @app.get("/api/namespaces")
-def namespaces():
+def namespaces(perms: UserPermissions = Depends(get_permissions)):
     G = _state["G"]
     if G is None:
         return {"namespaces": []}
@@ -322,7 +336,7 @@ def namespaces():
 
 
 @app.get("/api/tables")
-def tables(namespace: str = ""):
+def tables(namespace: str = "", perms: UserPermissions = Depends(get_permissions)):
     G = _state["G"]
     if G is None:
         return {"tables": []}
@@ -336,7 +350,7 @@ def tables(namespace: str = ""):
 
 
 @app.get("/api/schema")
-def schema(dataset: str, namespace: str | None = None):
+def schema(dataset: str, namespace: str | None = None, perms: UserPermissions = Depends(get_permissions)):
     G = _state["G"]
     if G is None:
         raise HTTPException(status_code=503, detail="Graph not loaded yet.")
@@ -364,7 +378,7 @@ def schema(dataset: str, namespace: str | None = None):
 
 
 @app.get("/api/trace")
-def trace(dataset: str, field: str | None = None, namespace: str | None = None):
+def trace(dataset: str, field: str | None = None, namespace: str | None = None, perms: UserPermissions = Depends(get_permissions)):
     """
     Trace column-level lineage for a field in a dataset.
     Useful for GDPR audits: find the exact origin of a sensitive field.
@@ -446,13 +460,13 @@ def trace(dataset: str, field: str | None = None, namespace: str | None = None):
 
 
 @app.get("/api/history")
-def history(n: int = 20):
+def history(n: int = 20, perms: UserPermissions = Depends(get_permissions)):
     msgs = load_history(n=n, chat_dir=CHAT_DIR)
     return {"messages": msgs}
 
 
 @app.get("/api/config")
-def config():
+def config(perms: UserPermissions = Depends(get_permissions)):
     return {
         "mode": "s3" if S3_BUCKET else "local",
         "bucket": S3_BUCKET,
