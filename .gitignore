@@ -3,6 +3,7 @@ data/
 openlineage/data/
 openlineage/events.ndjson
 chroma_data/
+knowledge/
 
 # Caché de Maven / Ivy (JARs descargados por spark.jars.packages)
 .ivy2/

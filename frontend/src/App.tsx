@@ -1,8 +1,49 @@
 import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { useMsal, MsalAuthenticationTemplate, useIsAuthenticated } from '@azure/msal-react'
+import { InteractionType } from '@azure/msal-browser'
 import { Autocomplete } from './components/Autocomplete'
 import { GraphView } from './components/GraphView'
+import { useAuthFetch } from './auth/useAuthFetch'
+import { loginRequest } from './auth/msalConfig'
+
+const SUGGESTIONS = [
+  '¿Qué datasets existen en producción?',
+  '¿Qué jobs producen el dataset contratos?',
+  '¿Qué se rompe si cambio el schema de orders?',
+  '¿De dónde viene la columna id_cliente?',
+]
+
+const LOADING_HINTS = [
+  'Consultando el grafo de linaje…',
+  'Buscando en el índice semántico…',
+  'Ejecutando herramienta…',
+  'Generando respuesta…',
+]
+
+function CodeBlock({ children }: { children: React.ReactNode }) {
+  const [copied, setCopied] = useState(false)
+  const text = (() => {
+    const child = (children as any)?.[0]
+    return child?.props?.children ?? ''
+  })()
+  return (
+    <div className="code-block-wrapper">
+      <button
+        className={`copy-btn${copied ? ' copied' : ''}`}
+        onClick={() => {
+          navigator.clipboard.writeText(String(text).trimEnd())
+          setCopied(true)
+          setTimeout(() => setCopied(false), 2000)
+        }}
+      >
+        {copied ? '✓ copiado' : 'copiar'}
+      </button>
+      <pre>{children}</pre>
+    </div>
+  )
+}
 
 type Role = 'user' | 'assistant'
 type Tab = 'chat' | 'impact' | 'graph' | 'tasks'
@@ -65,7 +106,10 @@ function timeAgo(ts: number) {
   return `hace ${Math.floor(s / 3600)}h`
 }
 
-export default function App() {
+function AppInner() {
+  const { instance, accounts } = useMsal()
+  const authFetch = useAuthFetch()
+  const account = accounts[0]
   const [tab, setTab] = useState<Tab>('chat')
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
@@ -80,6 +124,7 @@ export default function App() {
   const [allDatasets, setAllDatasets] = useState<DatasetEntry[]>([])
   const [allNamespaces, setAllNamespaces] = useState<string[]>([])
   const [tasks, setTasks] = useState<TaskEntry[]>(loadTasks)
+  const [loadingHint, setLoadingHint] = useState(0)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   const MAX_TASK_AGE_MS = 24 * 60 * 60 * 1000
@@ -101,6 +146,13 @@ export default function App() {
     return () => clearTimeout(t)
   }, [toast])
 
+  // Cycle loading hint text while waiting for response
+  useEffect(() => {
+    if (!loading) { setLoadingHint(0); return }
+    const t = setInterval(() => setLoadingHint(h => (h + 1) % LOADING_HINTS.length), 3000)
+    return () => clearInterval(t)
+  }, [loading])
+
   // Persist tasks
   useEffect(() => { saveTasks(tasks) }, [tasks])
 
@@ -110,7 +162,7 @@ export default function App() {
     const interval = setInterval(async () => {
       for (const task of pendingTasks) {
         try {
-          const r = await fetch(`/api/task/${task.id}`)
+          const r = await authFetch(`/api/task/${task.id}`)
           const data = await r.json()
           if (data.status !== task.status) {
             setTasks(prev => prev.map(t =>
@@ -125,7 +177,7 @@ export default function App() {
                 : t
             ))
             if (data.status === 'SUCCESS') {
-              await fetch('/api/reload', { method: 'POST' })
+              await authFetch('/api/reload', { method: 'POST' })
               fetchStats()
               fetchDatasets()
               setToast({ msg: `Sync completado - ${data.result?.docs ?? 0} docs`, type: 'success' })
@@ -142,7 +194,7 @@ export default function App() {
 
   async function fetchHistory() {
     try {
-      const r = await fetch('/api/history?n=30')
+      const r = await authFetch('/api/history?n=30')
       const data = await r.json()
       const loaded: Message[] = (data.messages ?? []).map((m: { role: Role; content: string }) => ({
         id: ++msgId,
@@ -155,7 +207,7 @@ export default function App() {
 
   async function fetchDatasets() {
     try {
-      const r = await fetch('/api/datasets')
+      const r = await authFetch('/api/datasets')
       const data = await r.json()
       setAllDatasets(data.datasets ?? [])
       setAllNamespaces(data.namespaces ?? [])
@@ -164,22 +216,20 @@ export default function App() {
 
   async function fetchStats() {
     try {
-      const r = await fetch('/api/stats')
+      const r = await authFetch('/api/stats')
       setStats(await r.json())
     } catch {
       setStats({ datasets: 0, jobs: 0, edges: 0, indexed_docs: 0, error: 'offline' })
     }
   }
 
-  async function sendMessage() {
-    const q = input.trim()
+  async function sendQuestion(q: string) {
     if (!q || loading) return
-    setInput('')
     setMessages(prev => [...prev, { id: ++msgId, role: 'user', content: q }])
     setLoading(true)
     try {
-      const history = messages.map(m => ({ role: m.role, content: m.content }))
-      const r = await fetch('/api/chat', {
+      const history = messages.slice(-10).map(m => ({ role: m.role, content: m.content }))
+      const r = await authFetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question: q, history }),
@@ -195,10 +245,31 @@ export default function App() {
     }
   }
 
+  async function sendMessage() {
+    const q = input.trim()
+    if (!q) return
+    setInput('')
+    await sendQuestion(q)
+  }
+
+  function handleAskAboutNode(node: { kind: string; name: string; namespace: string; field?: string }) {
+    setTab('chat')
+    const ns = node.namespace ? ` (${node.namespace})` : ''
+    let q: string
+    if (node.field) {
+      q = `Cuéntame sobre la columna "${node.field}" del dataset "${node.name}"${ns}: de dónde viene, qué transformaciones sufre y qué jobs la producen o modifican.`
+    } else if (node.kind === 'job') {
+      q = `Cuéntame sobre el job ETL "${node.name}": qué datasets lee y escribe, cuál es su lógica y su historial de ejecuciones recientes.`
+    } else {
+      q = `Cuéntame sobre el dataset "${node.name}"${ns}: su schema, los jobs que lo producen y consumen, y si tiene linaje de columnas disponible.`
+    }
+    sendQuestion(q)
+  }
+
   async function handleSync() {
     setSyncing(true)
     try {
-      const r = await fetch('/api/sync', { method: 'POST' })
+      const r = await authFetch('/api/sync', { method: 'POST' })
       const data = await r.json()
       if (!r.ok) throw new Error(data.detail || 'Error')
       const newTask: TaskEntry = {
@@ -222,7 +293,7 @@ export default function App() {
     setImpactLoading(true)
     setImpactResults(null)
     try {
-      const r = await fetch('/api/impact', {
+      const r = await authFetch('/api/impact', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ dataset: table, namespace: impactNamespace.trim() || null }),
@@ -253,13 +324,19 @@ export default function App() {
     </svg>
   )
 
+  const isAuthenticated = useIsAuthenticated()
+
+  // When MSAL is configured but the user hasn't finished the redirect yet,
+  // render nothing — MsalAuthenticationTemplate handles the loading/redirect.
+  if (import.meta.env.VITE_AZURE_CLIENT_ID && !isAuthenticated) return null
+
   return (
     <>
       {/* Header */}
       <header className="header">
         <div className="header-title">
-          <span className="dot" />
-          RAG Lineage
+          <img src="/rootly.jpeg" alt="Rootly" className="header-logo" />
+          Rootly
         </div>
         <div className="header-stats">
           {stats && !stats.error ? (
@@ -270,6 +347,20 @@ export default function App() {
             </>
           ) : (
             <span className="stat-badge muted">sin índice</span>
+          )}
+          {account && (
+            <>
+              <span className="stat-badge muted" title={account.username}>
+                {account.name ?? account.username}
+              </span>
+              <button
+                className="sync-btn"
+                onClick={() => instance.logoutRedirect()}
+                title="Cerrar sesión"
+              >
+                Salir
+              </button>
+            </>
           )}
           <button className={`sync-btn ${syncing ? 'spinning' : ''}`} onClick={handleSync} disabled={syncing}>
             <svg className="sync-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -302,12 +393,17 @@ export default function App() {
               {messages.length === 0 && !loading && (
                 <div className="empty-state">
                   <div className="icon">
-                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2" opacity="0.5">
-                      <circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35M11 8v6M8 11h6" />
-                    </svg>
+                    <img src="/rootly.jpeg" alt="Rootly" className="empty-logo" />
                   </div>
                   <h3>Consulta tu linaje de datos</h3>
                   <p>Pregunta sobre datasets, pipelines, impacto de cambios de schema y más.</p>
+                  <div className="suggestions">
+                    {SUGGESTIONS.map(s => (
+                      <button key={s} className="suggestion-chip" onClick={() => setInput(s)}>
+                        {s}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               )}
               {messages.map(msg => (
@@ -315,7 +411,14 @@ export default function App() {
                   <span className="message-label">{msg.role === 'user' ? 'Tú' : 'Asistente'}</span>
                   <div className="bubble">
                     {msg.role === 'assistant'
-                      ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+                      ? (
+                        <ReactMarkdown
+                          remarkPlugins={[remarkGfm]}
+                          components={{ pre: ({ children }) => <CodeBlock>{children}</CodeBlock> }}
+                        >
+                          {msg.content}
+                        </ReactMarkdown>
+                      )
                       : msg.content}
                   </div>
                 </div>
@@ -323,7 +426,12 @@ export default function App() {
               {loading && (
                 <div className="message assistant">
                   <span className="message-label">Asistente</span>
-                  <div className="bubble"><div className="typing"><span /><span /><span /></div></div>
+                  <div className="bubble">
+                    <div className="typing">
+                      <span /><span /><span />
+                      <span className="loading-hint">{LOADING_HINTS[loadingHint]}</span>
+                    </div>
+                  </div>
                 </div>
               )}
               <div ref={messagesEndRef} />
@@ -331,7 +439,13 @@ export default function App() {
             <div className="input-bar">
               <textarea rows={1} value={input} onChange={e => setInput(e.target.value)}
                 onKeyDown={handleChatKey} placeholder="¿Qué pipelines fallarían si cambio el schema de orders?"
-                disabled={loading} style={{ minHeight: '42px', maxHeight: '120px' }} />
+                disabled={loading}
+                style={{ minHeight: '42px', maxHeight: '120px' }}
+                onInput={e => {
+                  const el = e.currentTarget
+                  el.style.height = 'auto'
+                  el.style.height = `${Math.min(el.scrollHeight, 120)}px`
+                }} />
               <button className="send-btn" onClick={sendMessage} disabled={loading || !input.trim()}>Enviar</button>
             </div>
           </>
@@ -398,7 +512,7 @@ export default function App() {
         {/* ── Grafo ── */}
         {tab === 'graph' && (
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-            <GraphView />
+            <GraphView onAskAboutNode={handleAskAboutNode} />
           </div>
         )}
 
@@ -468,5 +582,20 @@ export default function App() {
 
       {toast && <div className={`toast ${toast.type}`}>{toast.msg}</div>}
     </>
+  )
+}
+
+export default function App() {
+  if (!import.meta.env.VITE_AZURE_CLIENT_ID) {
+    // Dev mode: no Azure config — render directly, no auth guard
+    return <AppInner />
+  }
+  return (
+    <MsalAuthenticationTemplate
+      interactionType={InteractionType.Redirect}
+      authenticationRequest={loginRequest}
+    >
+      <AppInner />
+    </MsalAuthenticationTemplate>
   )
 }

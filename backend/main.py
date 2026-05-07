@@ -7,9 +7,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from backend.permissions import UserPermissions, get_permissions
 
 from celery.result import AsyncResult
 
@@ -26,14 +28,14 @@ from rag.ingest import (
 )
 from rag.tools.dataset import downstream_layers as _downstream_layers
 from rag.query import ask, load_history, _downstream_layers
-from rag.vectorize import get_collection
+from rag.vectorize import get_collection, load_graph_cache
 
 app = FastAPI(title="RAG Lineage API")
 
 
-# @app.on_event("startup")
-# def startup():
-#     threading.Thread(target=_ensure_loaded, daemon=True).start()
+@app.on_event("startup")
+def startup():
+    threading.Thread(target=_ensure_loaded, daemon=True).start()
 
 
 app.add_middleware(
@@ -43,7 +45,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_state: dict = {"G": None, "collection": None, "loaded_at": 0.0}
+_state: dict = {"G": None, "collection": None, "loaded_at": 0.0, "filter_terms": None, "datasets_resp": None}
 _load_lock = threading.Lock()
 _last_reloaded_task: str | None = None
 
@@ -58,12 +60,37 @@ def _ensure_loaded():
         if _state["collection"] is not None:  # otro hilo cargó mientras esperábamos
             return _state["G"], _state["collection"]
 
-        events = load_events()
-        G = build_graph(events)
         collection = get_collection()
-        if collection.count() == 0:
-            print("[ensure_loaded] WARNING: ChromaDB is empty. Run /api/sync.")
+        if collection.count() > 0:
+            G = load_graph_cache()
+            if G is not None:
+                print(f"[ensure_loaded] Restored from cache — {G.number_of_nodes()} nodes, {collection.count()} docs in ChromaDB.")
+            else:
+                print("[ensure_loaded] ChromaDB has data but no graph cache — rebuilding from local events.")
+                events = load_events()
+                G = build_graph(events)
+        else:
+            print("[ensure_loaded] ChromaDB is empty. Run /api/sync to populate.")
+            events = load_events()
+            G = build_graph(events)
+
         _state.update({"G": G, "collection": collection, "loaded_at": time.time()})
+
+        all_metas = collection.get(include=["metadatas"])["metadatas"] or []
+        _state["filter_terms"] = {
+            "namespaces": {str(v) for m in all_metas if (v := m.get("namespace"))},
+            "names": {str(v) for m in all_metas if (v := m.get("name"))},
+        }
+
+        datasets = [
+            {"key": k, "namespace": d.get("namespace", ""), "name": d.get("name", k)}
+            for k, d in G.nodes(data=True)
+            if d.get("kind") == "dataset"
+        ]
+        _state["datasets_resp"] = {
+            "datasets": datasets,
+            "namespaces": sorted({d["namespace"] for d in datasets if d["namespace"]}),
+        }
 
     return _state["G"], _state["collection"]
 
@@ -103,8 +130,20 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/api/me")
+def me(perms: UserPermissions = Depends(get_permissions)):
+    return {
+        "user_id": perms.user_id,
+        "email": perms.email,
+        "is_admin": perms.is_admin,
+        "allowed_datasets": perms.allowed_datasets,
+        "allowed_namespaces": perms.allowed_namespaces,
+        "has_role_arn": perms.role_arn is not None,
+    }
+
+
 @app.get("/api/stats")
-def stats():
+def stats(perms: UserPermissions = Depends(get_permissions)):
     try:
         G, collection = _state["G"], _state["collection"]
         n_ds = sum(1 for _, d in G.nodes(data=True) if d.get("kind") == "dataset")
@@ -126,7 +165,7 @@ def stats():
 
 
 @app.post("/api/chat")
-def chat(req: ChatRequest):
+def chat(req: ChatRequest, perms: UserPermissions = Depends(get_permissions)):
     try:
         history = [{"role": m.role, "content": m.content} for m in req.history]
         answer = ask(
@@ -137,6 +176,7 @@ def chat(req: ChatRequest):
             G=_state["G"],
             bucket=S3_BUCKET,
             jobs_prefix=S3_JOBS_PREFIX,
+            filter_terms=_state.get("filter_terms"),
         )
         _save_chat(req.question, answer)
         return {"answer": answer}
@@ -151,7 +191,9 @@ def chat(req: ChatRequest):
 
 
 @app.get("/api/datasets")
-def list_datasets():
+def list_datasets(perms: UserPermissions = Depends(get_permissions)):
+    if _state.get("datasets_resp"):
+        return _state["datasets_resp"]
     try:
         G = _state["G"]
         datasets = []
@@ -171,7 +213,7 @@ def list_datasets():
 
 
 @app.post("/api/impact")
-def impact(req: ImpactRequest):
+def impact(req: ImpactRequest, perms: UserPermissions = Depends(get_permissions)):
     G = _state["G"]
     if G is None:
         raise HTTPException(status_code=503, detail="Graph not loaded yet.")
@@ -208,7 +250,7 @@ def impact(req: ImpactRequest):
 
 
 @app.post("/api/sync")
-def do_sync():
+def do_sync(perms: UserPermissions = Depends(get_permissions)):
     try:
         task = run_sync_task.delay(
             bucket=S3_BUCKET,
@@ -226,7 +268,7 @@ def do_sync():
 
 
 @app.get("/api/task/{task_id}")
-def task_status(task_id: str):
+def task_status(task_id: str, perms: UserPermissions = Depends(get_permissions)):
     global _last_reloaded_task
     result = AsyncResult(task_id, app=celery_app)
     data: dict = {"task_id": task_id, "status": result.state}
@@ -245,6 +287,8 @@ def task_status(task_id: str):
                     _state["G"] = None
                     _state["collection"] = None
                     _state["loaded_at"] = 0.0
+                    _state["filter_terms"] = None
+                    _state["datasets_resp"] = None
                     should_reload = True
             else:
                 print(f"[task_status] task={task_id} SUCCESS (already processed) — skipping reload.")
@@ -257,7 +301,7 @@ def task_status(task_id: str):
 
 
 @app.get("/api/graph")
-def graph():
+def graph(perms: UserPermissions = Depends(get_permissions)):
     G = _state["G"]
     if G is None:
         raise HTTPException(status_code=503, detail="Graph not loaded yet.")
@@ -278,32 +322,87 @@ def graph():
     return {"nodes": nodes, "edges": edges}
 
 
+@app.get("/api/namespaces")
+def namespaces(perms: UserPermissions = Depends(get_permissions)):
+    G = _state["G"]
+    if G is None:
+        return {"namespaces": []}
+    ns = sorted({
+        d.get("namespace", "")
+        for _, d in G.nodes(data=True)
+        if d.get("kind") == "dataset" and d.get("namespace")
+    })
+    return {"namespaces": ns}
+
+
+@app.get("/api/tables")
+def tables(namespace: str = "", perms: UserPermissions = Depends(get_permissions)):
+    G = _state["G"]
+    if G is None:
+        return {"tables": []}
+    result = sorted({
+        d.get("name", k)
+        for k, d in G.nodes(data=True)
+        if d.get("kind") == "dataset"
+        and (not namespace or d.get("namespace", "") == namespace)
+    })
+    return {"tables": result}
+
+
+@app.get("/api/schema")
+def schema(dataset: str, namespace: str | None = None, perms: UserPermissions = Depends(get_permissions)):
+    G = _state["G"]
+    if G is None:
+        raise HTTPException(status_code=503, detail="Graph not loaded yet.")
+    matches = [
+        d for _, d in G.nodes(data=True)
+        if d.get("kind") == "dataset"
+        and d.get("name", "").lower() == dataset.lower()
+        and (not namespace or d.get("namespace", "") == namespace)
+    ]
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"Dataset '{dataset}' not found.")
+    node = matches[0]
+    columns = []
+    for raw in node.get("schema", []):
+        if " (" in raw and raw.endswith(")"):
+            name, type_part = raw.rsplit(" (", 1)
+            columns.append({"name": name, "type": type_part[:-1]})
+        else:
+            columns.append({"name": raw, "type": ""})
+    return {
+        "dataset": node.get("name"),
+        "namespace": node.get("namespace"),
+        "columns": columns,
+    }
+
+
 @app.get("/api/trace")
-def trace(dataset: str, field: str | None = None):
+def trace(dataset: str, field: str | None = None, namespace: str | None = None, perms: UserPermissions = Depends(get_permissions)):
     """
     Trace column-level lineage for a field in a dataset.
     Useful for GDPR audits: find the exact origin of a sensitive field.
 
     ?dataset=customers&field=email  -> recursive trace of email in customers
     ?dataset=customers              -> full column lineage for the dataset
+    ?namespace=ns&dataset=customers -> scoped to a specific namespace
     """
     G = _state["G"]
     if G is None:
         raise HTTPException(status_code=503, detail="Graph not loaded yet.")
 
-    matches = [
-        (k, d)
-        for k, d in G.nodes(data=True)
-        if d.get("kind") == "dataset"
-        and dataset.lower() in d.get("name", "").lower()
-    ]
+    all_ds = [(k, d) for k, d in G.nodes(data=True) if d.get("kind") == "dataset"]
+    if namespace:
+        all_ds = [(k, d) for k, d in all_ds if d.get("namespace", "") == namespace]
+    exact = [(k, d) for k, d in all_ds if d.get("name", "").lower() == dataset.lower()]
+    matches = exact or [(k, d) for k, d in all_ds if dataset.lower() in d.get("name", "").lower()]
     if not matches:
         raise HTTPException(status_code=404, detail=f"Dataset '{dataset}' not found.")
 
     def _trace_field(ds_name: str, out_field: str, visited: set, depth: int) -> dict:
         """Recursively trace a field back to its origins."""
         if depth > 6 or (ds_name, out_field) in visited:
-            return {"field": out_field, "dataset": ds_name, "sources": [], "cycle": depth > 6}
+            return {"field": out_field, "dataset": ds_name, "namespace": "", "sources": [], "cycle": depth > 6}
         visited.add((ds_name, out_field))
 
         src_node = next(
@@ -313,6 +412,7 @@ def trace(dataset: str, field: str | None = None):
             ),
             None,
         )
+        ns = src_node[1].get("namespace", "") if src_node else ""
         col_lineage = src_node[1].get("column_lineage", {}) if src_node else {}
         sources_meta = col_lineage.get(out_field, [])
 
@@ -323,7 +423,7 @@ def trace(dataset: str, field: str | None = None):
             child["transform_subtype"] = s.get("subtype", "?")
             sources.append(child)
 
-        return {"field": out_field, "dataset": ds_name, "sources": sources}
+        return {"field": out_field, "dataset": ds_name, "namespace": ns, "sources": sources}
 
     results = []
     for node_key, data in matches:
@@ -360,13 +460,13 @@ def trace(dataset: str, field: str | None = None):
 
 
 @app.get("/api/history")
-def history(n: int = 20):
+def history(n: int = 20, perms: UserPermissions = Depends(get_permissions)):
     msgs = load_history(n=n, chat_dir=CHAT_DIR)
     return {"messages": msgs}
 
 
 @app.get("/api/config")
-def config():
+def config(perms: UserPermissions = Depends(get_permissions)):
     return {
         "mode": "s3" if S3_BUCKET else "local",
         "bucket": S3_BUCKET,
