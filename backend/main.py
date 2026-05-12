@@ -1,5 +1,7 @@
 import os
 import time
+import uuid
+import json
 import threading
 from datetime import datetime, timezone
 
@@ -27,7 +29,7 @@ from rag.ingest import (
     load_events,
 )
 from rag.tools.dataset import downstream_layers as _downstream_layers
-from rag.query import ask, load_history, _downstream_layers
+from rag.query import ask, _downstream_layers
 from rag.vectorize import get_collection, load_graph_cache
 
 app = FastAPI(title="RAG Lineage API")
@@ -95,19 +97,61 @@ def _ensure_loaded():
     return _state["G"], _state["collection"]
 
 
-def _save_chat(question: str, answer: str) -> None:
+def _session_path(session_id: str) -> str:
+    return os.path.join(CHAT_DIR, f"{session_id}.json")
+
+
+def _create_session(first_message: str) -> dict:
     os.makedirs(CHAT_DIR, exist_ok=True)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    path = os.path.join(CHAT_DIR, f"{today}.md")
-    is_new = not os.path.exists(path)
-    with open(path, "a") as f:
-        if is_new:
-            f.write(f"# Lineage chat - {today}\n\n")
-        f.write(f"## {ts}\n\n")
-        f.write(f"**Question:** {question}\n\n")
-        f.write(f"{answer}\n\n")
-        f.write("---\n\n")
+    session_id = str(uuid.uuid4())
+    title = first_message[:60] + ("…" if len(first_message) > 60 else "")
+    now = time.time()
+    session = {"id": session_id, "title": title, "created_at": now, "updated_at": now, "messages": []}
+    with open(_session_path(session_id), "w", encoding="utf-8") as f:
+        json.dump(session, f, ensure_ascii=False, indent=2)
+    return session
+
+
+def _append_session_messages(session_id: str, question: str, answer: str) -> None:
+    path = _session_path(session_id)
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        session = json.load(f)
+    session["messages"].append({"role": "user", "content": question})
+    session["messages"].append({"role": "assistant", "content": answer})
+    session["updated_at"] = time.time()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(session, f, ensure_ascii=False, indent=2)
+
+
+def _list_sessions() -> list[dict]:
+    os.makedirs(CHAT_DIR, exist_ok=True)
+    sessions = []
+    for fname in os.listdir(CHAT_DIR):
+        if not fname.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(CHAT_DIR, fname), encoding="utf-8") as f:
+                s = json.load(f)
+            sessions.append({
+                "id": s["id"],
+                "title": s["title"],
+                "created_at": s["created_at"],
+                "updated_at": s["updated_at"],
+                "message_count": len(s["messages"]) // 2,
+            })
+        except Exception:
+            pass
+    return sorted(sessions, key=lambda x: x["updated_at"], reverse=True)
+
+
+def _get_session(session_id: str) -> dict | None:
+    path = _session_path(session_id)
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 class ChatMessage(BaseModel):
@@ -118,6 +162,11 @@ class ChatRequest(BaseModel):
     question: str
     n: int = 20
     history: list[ChatMessage] = []
+    session_id: str | None = None
+
+
+class UpdateSessionRequest(BaseModel):
+    title: str
 
 
 class ImpactRequest(BaseModel):
@@ -178,8 +227,12 @@ def chat(req: ChatRequest, perms: UserPermissions = Depends(get_permissions)):
             jobs_prefix=S3_JOBS_PREFIX,
             filter_terms=_state.get("filter_terms"),
         )
-        _save_chat(req.question, answer)
-        return {"answer": answer}
+        session_id = req.session_id
+        if not session_id:
+            session = _create_session(req.question)
+            session_id = session["id"]
+        _append_session_messages(session_id, req.question, answer)
+        return {"answer": answer, "session_id": session_id}
     except Exception as e:
         err = str(e)
         if "rate_limit_error" in err or "rate limit" in err.lower():
@@ -188,6 +241,40 @@ def chat(req: ChatRequest, perms: UserPermissions = Depends(get_permissions)):
                 detail="Límite de uso de la API alcanzado. Espera unos segundos e inténtalo de nuevo.",
             )
         raise HTTPException(status_code=500, detail=err)
+
+
+@app.get("/api/sessions")
+def list_sessions():
+    return {"sessions": _list_sessions()}
+
+
+@app.get("/api/sessions/{session_id}")
+def get_session(session_id: str):
+    session = _get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
+
+
+@app.put("/api/sessions/{session_id}")
+def update_session_title(session_id: str, req: UpdateSessionRequest):
+    path = _session_path(session_id)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Session not found")
+    with open(path, encoding="utf-8") as f:
+        session = json.load(f)
+    session["title"] = req.title
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(session, f, ensure_ascii=False, indent=2)
+    return {"ok": True}
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str):
+    path = _session_path(session_id)
+    if os.path.exists(path):
+        os.remove(path)
+    return {"ok": True}
 
 
 @app.get("/api/datasets")
@@ -460,9 +547,8 @@ def trace(dataset: str, field: str | None = None, namespace: str | None = None, 
 
 
 @app.get("/api/history")
-def history(n: int = 20, perms: UserPermissions = Depends(get_permissions)):
-    msgs = load_history(n=n, chat_dir=CHAT_DIR)
-    return {"messages": msgs}
+def history(n: int = 20):
+    return {"messages": []}
 
 
 @app.get("/api/config")

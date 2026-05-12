@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import networkx as nx
 
-_MAX_CODE_LINES = 80
+_MAX_CODE_LINES = 4_000_000
 
 
 def _format_code(code: str, job_name: str) -> str:

@@ -22,8 +22,9 @@ import re
 import sys
 from datetime import datetime, timezone
 
-import anthropic
 from dotenv import load_dotenv
+
+from rag.llm import LLMClient, get_client
 
 load_dotenv()
 
@@ -184,7 +185,7 @@ def _detect_filters(
         return None, None
 
 
-def _rewrite_query(question: str, history: list[dict], client: anthropic.Anthropic) -> str:
+def _rewrite_query(question: str, history: list[dict], client: LLMClient) -> str:
     """Rewrite the question as optimal search terms for the RAG index."""
     recent = [
         (m["content"] if m["role"] == "user" else m["content"][:200])
@@ -200,7 +201,7 @@ def _rewrite_query(question: str, history: list[dict], client: anthropic.Anthrop
         f"{ctx_block}Pregunta: {question}"
     )
     try:
-        resp = client.messages.create(
+        resp = client.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=120,
             messages=[{"role": "user", "content": prompt}],
@@ -212,7 +213,7 @@ def _rewrite_query(question: str, history: list[dict], client: anthropic.Anthrop
 
 
 def _rerank_docs(
-    question: str, docs: list[str], client: anthropic.Anthropic, top_k: int = 8
+    question: str, docs: list[str], client: LLMClient, top_k: int = 8
 ) -> list[str]:
     """Filter and reorder retrieved docs by relevance using Claude Haiku."""
     if len(docs) <= top_k:
@@ -226,7 +227,7 @@ def _rerank_docs(
         "Responde SOLO con los índices separados por coma, ejemplo: 2,0,5,1"
     )
     try:
-        resp = client.messages.create(
+        resp = client.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=60,
             messages=[{"role": "user", "content": prompt}],
@@ -505,7 +506,8 @@ def ask(
 
     response = None
     intermediate_texts: list[str] = []
-    for _ in range(4):
+    for _ in range(10):
+        print(f"[debug] Sending message to Sonnet (turn {_ + 1})...")
         response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=8192,

@@ -55,6 +55,14 @@ interface Message {
   content: string
 }
 
+interface SessionEntry {
+  id: string
+  title: string
+  created_at: number
+  updated_at: number
+  message_count: number
+}
+
 interface Stats {
   datasets: number
   jobs: number
@@ -100,10 +108,11 @@ function saveTasks(tasks: TaskEntry[]) {
 }
 
 function timeAgo(ts: number) {
-  const s = Math.floor((Date.now() - ts) / 1000)
+  const s = Math.floor((Date.now() - ts * 1000) / 1000)
   if (s < 60) return `hace ${s}s`
   if (s < 3600) return `hace ${Math.floor(s / 60)}m`
-  return `hace ${Math.floor(s / 3600)}h`
+  if (s < 86400) return `hace ${Math.floor(s / 3600)}h`
+  return `hace ${Math.floor(s / 86400)}d`
 }
 
 function AppInner() {
@@ -125,6 +134,10 @@ function AppInner() {
   const [allNamespaces, setAllNamespaces] = useState<string[]>([])
   const [tasks, setTasks] = useState<TaskEntry[]>(loadTasks)
   const [loadingHint, setLoadingHint] = useState(0)
+  const [sessions, setSessions] = useState<SessionEntry[]>([])
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null)
+  const [editingSessionId, setEditingSessionId] = useState<string | null>(null)
+  const [editingTitle, setEditingTitle] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   const MAX_TASK_AGE_MS = 24 * 60 * 60 * 1000
@@ -133,30 +146,24 @@ function AppInner() {
     Date.now() - t.started_at < MAX_TASK_AGE_MS
   )
 
-  // Initial load
-  useEffect(() => { fetchStats(); fetchDatasets(); fetchHistory() }, [])
+  useEffect(() => { fetchStats(); fetchDatasets(); fetchSessions() }, [])
 
-  // Auto-scroll chat
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, loading])
 
-  // Toast auto-dismiss
   useEffect(() => {
     if (!toast) return
     const t = setTimeout(() => setToast(null), 3500)
     return () => clearTimeout(t)
   }, [toast])
 
-  // Cycle loading hint text while waiting for response
   useEffect(() => {
     if (!loading) { setLoadingHint(0); return }
     const t = setInterval(() => setLoadingHint(h => (h + 1) % LOADING_HINTS.length), 3000)
     return () => clearInterval(t)
   }, [loading])
 
-  // Persist tasks
   useEffect(() => { saveTasks(tasks) }, [tasks])
 
-  // Poll pending tasks every 3 seconds
   useEffect(() => {
     if (pendingTasks.length === 0) return
     const interval = setInterval(async () => {
@@ -192,16 +199,54 @@ function AppInner() {
     return () => clearInterval(interval)
   }, [pendingTasks])
 
-  async function fetchHistory() {
+  async function fetchSessions() {
     try {
-      const r = await authFetch('/api/history?n=30')
+      const r = await fetch('/api/sessions')
+      const data = await r.json()
+      setSessions(data.sessions ?? [])
+    } catch { /* silent */ }
+  }
+
+  async function loadSession(id: string) {
+    if (id === currentSessionId) return
+    setCurrentSessionId(id)
+    try {
+      const r = await fetch(`/api/sessions/${id}`)
       const data = await r.json()
       const loaded: Message[] = (data.messages ?? []).map((m: { role: Role; content: string }) => ({
         id: ++msgId,
         role: m.role,
         content: m.content,
       }))
-      if (loaded.length > 0) setMessages(loaded)
+      setMessages(loaded)
+    } catch { /* silent */ }
+  }
+
+  function newChat() {
+    setCurrentSessionId(null)
+    setMessages([])
+  }
+
+  async function renameSession(id: string, title: string) {
+    if (!title.trim()) return
+    try {
+      await fetch(`/api/sessions/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: title.trim() }),
+      })
+      setSessions(prev => prev.map(s => s.id === id ? { ...s, title: title.trim() } : s))
+    } catch { /* silent */ }
+  }
+
+  async function deleteSession(id: string) {
+    try {
+      await fetch(`/api/sessions/${id}`, { method: 'DELETE' })
+      setSessions(prev => prev.filter(s => s.id !== id))
+      if (currentSessionId === id) {
+        setCurrentSessionId(null)
+        setMessages([])
+      }
     } catch { /* silent */ }
   }
 
@@ -232,12 +277,16 @@ function AppInner() {
       const r = await authFetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: q, history }),
+        body: JSON.stringify({ question: q, history, session_id: currentSessionId }),
       })
       const data = await r.json()
       if (r.status === 429) throw new Error(data.detail || 'Límite de uso alcanzado. Espera unos segundos e inténtalo de nuevo.')
       if (!r.ok) throw new Error(data.detail || 'Error del servidor')
+      if (data.session_id && data.session_id !== currentSessionId) {
+        setCurrentSessionId(data.session_id)
+      }
       setMessages(prev => [...prev, { id: ++msgId, role: 'assistant', content: data.answer }])
+      fetchSessions()
     } catch (e: any) {
       setMessages(prev => [...prev, { id: ++msgId, role: 'assistant', content: `**Error:** ${e.message}` }])
     } finally {
@@ -383,202 +432,282 @@ function AppInner() {
         </button>
       </nav>
 
-      {/* Main */}
-      <main className="main">
+      {/* Content row */}
+      <div className="content-row">
 
-        {/* ── Chat ── */}
+        {/* ── Sidebar (chat only) ── */}
         {tab === 'chat' && (
-          <>
-            <div className="messages">
-              {messages.length === 0 && !loading && (
-                <div className="empty-state">
-                  <div className="icon">
-                    <img src="/rootly.jpeg" alt="Rootly" className="empty-logo" />
-                  </div>
-                  <h3>Consulta tu linaje de datos</h3>
-                  <p>Pregunta sobre datasets, pipelines, impacto de cambios de schema y más.</p>
-                  <div className="suggestions">
-                    {SUGGESTIONS.map(s => (
-                      <button key={s} className="suggestion-chip" onClick={() => setInput(s)}>
-                        {s}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {messages.map(msg => (
-                <div key={msg.id} className={`message ${msg.role}`}>
-                  <span className="message-label">{msg.role === 'user' ? 'Tú' : 'Asistente'}</span>
-                  <div className="bubble">
-                    {msg.role === 'assistant'
-                      ? (
-                        <ReactMarkdown
-                          remarkPlugins={[remarkGfm]}
-                          components={{ pre: ({ children }) => <CodeBlock>{children}</CodeBlock> }}
-                        >
-                          {msg.content}
-                        </ReactMarkdown>
-                      )
-                      : msg.content}
-                  </div>
-                </div>
-              ))}
-              {loading && (
-                <div className="message assistant">
-                  <span className="message-label">Asistente</span>
-                  <div className="bubble">
-                    <div className="typing">
-                      <span /><span /><span />
-                      <span className="loading-hint">{LOADING_HINTS[loadingHint]}</span>
-                    </div>
-                  </div>
-                </div>
-              )}
-              <div ref={messagesEndRef} />
-            </div>
-            <div className="input-bar">
-              <textarea rows={1} value={input} onChange={e => setInput(e.target.value)}
-                onKeyDown={handleChatKey} placeholder="¿Qué pipelines fallarían si cambio el schema de orders?"
-                disabled={loading}
-                style={{ minHeight: '42px', maxHeight: '120px' }}
-                onInput={e => {
-                  const el = e.currentTarget
-                  el.style.height = 'auto'
-                  el.style.height = `${Math.min(el.scrollHeight, 120)}px`
-                }} />
-              <button className="send-btn" onClick={sendMessage} disabled={loading || !input.trim()}>Enviar</button>
-            </div>
-          </>
-        )}
-
-        {/* ── Impacto ── */}
-        {tab === 'impact' && (
-          <div className="impact-panel">
-            <div className="impact-search">
-              <Autocomplete label="Base de datos" value={impactNamespace}
-                onChange={v => { setImpactNamespace(v); setImpactResults(null) }}
-                suggestions={allNamespaces} placeholder="Filtra por namespace…" disabled={impactLoading} />
-              <Autocomplete label="Tabla" value={impactTable}
-                onChange={v => { setImpactTable(v); setImpactResults(null) }}
-                suggestions={tableSuggestions} placeholder="Busca una tabla…" disabled={impactLoading} />
-              <button className="send-btn" onClick={runImpact} disabled={impactLoading || !impactTable.trim()}>
-                {impactLoading ? 'Analizando…' : 'Analizar'}
+          <aside className="sidebar">
+            <div className="sidebar-header">
+              <button className="new-chat-btn" onClick={newChat}>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                  <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
+                </svg>
+                Nuevo chat
               </button>
             </div>
-            <div className="impact-results">
-              {!impactResults && !impactLoading && (
-                <div className="empty-state">
-                  <div className="icon">
-                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2" opacity="0.5">
-                      <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
-                    </svg>
-                  </div>
-                  <h3>Análisis de impacto</h3>
-                  <p>Selecciona una tabla para ver qué jobs y datasets downstream se verían afectados.</p>
-                </div>
+            <div className="sessions-list">
+              {sessions.length === 0 && (
+                <div className="sessions-empty">Sin conversaciones</div>
               )}
-              {impactResults?.length === 0 && (
-                <p className="no-impact">Dataset no encontrado. Comprueba el nombre o ejecuta Sync.</p>
-              )}
-              {impactResults?.map((result, i) => (
-                <div key={i} className="impact-card">
-                  <h3>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                      <ellipse cx="12" cy="5" rx="9" ry="3" />
-                      <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
-                      <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
-                    </svg>
-                    {result.dataset}
-                  </h3>
-                  {result.layers.length === 0 && <p style={{ color: 'var(--text-muted)', fontSize: '13px' }}>Sin dependencias downstream.</p>}
-                  {result.layers.map((layer, li) => (
-                    <div key={li} className="impact-layer">
-                      <div className="impact-layer-label">Nivel {li + 1}</div>
-                      <div className="impact-nodes">
-                        {layer.map((node, ni) => (
-                          <span key={ni} className={`impact-node ${node.kind}`}>
-                            {node.kind === 'job' ? '⚙' : '◈'} {node.name}
-                          </span>
-                        ))}
+              {sessions.map(session => (
+                <div
+                  key={session.id}
+                  className={`session-item ${session.id === currentSessionId ? 'active' : ''}`}
+                  onClick={() => loadSession(session.id)}
+                >
+                  {editingSessionId === session.id ? (
+                    <input
+                      className="session-title-input"
+                      value={editingTitle}
+                      autoFocus
+                      onChange={e => setEditingTitle(e.target.value)}
+                      onBlur={() => { renameSession(session.id, editingTitle); setEditingSessionId(null) }}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') { renameSession(session.id, editingTitle); setEditingSessionId(null) }
+                        if (e.key === 'Escape') setEditingSessionId(null)
+                      }}
+                      onClick={e => e.stopPropagation()}
+                    />
+                  ) : (
+                    <>
+                      <div className="session-info">
+                        <span className="session-title">{session.title}</span>
+                        <span className="session-time">{timeAgo(session.updated_at)}</span>
                       </div>
-                    </div>
-                  ))}
+                      <div className="session-actions">
+                        <button
+                          className="session-action-btn"
+                          title="Renombrar"
+                          onClick={e => {
+                            e.stopPropagation()
+                            setEditingSessionId(session.id)
+                            setEditingTitle(session.title)
+                          }}
+                        >
+                          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+                          </svg>
+                        </button>
+                        <button
+                          className="session-action-btn delete"
+                          title="Eliminar"
+                          onClick={e => { e.stopPropagation(); deleteSession(session.id) }}
+                        >
+                          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                            <polyline points="3 6 5 6 21 6" />
+                            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                            <path d="M10 11v6M14 11v6" />
+                            <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                          </svg>
+                        </button>
+                      </div>
+                    </>
+                  )}
                 </div>
               ))}
             </div>
-          </div>
+          </aside>
         )}
 
-        {/* ── Grafo ── */}
-        {tab === 'graph' && (
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-            <GraphView onAskAboutNode={handleAskAboutNode} />
-          </div>
-        )}
+        {/* ── Main ── */}
+        <main className="main">
 
-        {/* ── Tareas ── */}
-        {tab === 'tasks' && (
-          <div className="tasks-panel">
-            <div className="tasks-header">
-              <span>{tasks.length} tarea{tasks.length !== 1 ? 's' : ''} · polling cada 3s para las activas</span>
-              {tasks.length > 0 && (
-                <button className="clear-btn" onClick={() => setTasks([])}>Limpiar todo</button>
-              )}
-            </div>
-            <div className="tasks-list">
-              {tasks.length === 0 && (
-                <div className="empty-state">
-                  <div className="icon">
-                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2" opacity="0.5">
-                      <path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
-                    </svg>
-                  </div>
-                  <h3>Sin tareas</h3>
-                  <p>Pulsa <strong>Sync</strong> para encolar un sync y verlo aquí.</p>
-                </div>
-              )}
-              {tasks.map(task => (
-                <div key={task.id} className={`task-card ${task.status}`}>
-                  <div className={`task-icon ${task.status}`}>
-                    {task.status === 'SUCCESS' && (
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
-                        <polyline points="20 6 9 17 4 12" />
-                      </svg>
-                    )}
-                    {task.status === 'FAILURE' && (
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
-                        <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
-                      </svg>
-                    )}
-                    {(task.status === 'STARTED' || task.status === 'PENDING') && <SpinIcon />}
-                  </div>
-                  <div className="task-body">
-                    <div className="task-top">
-                      <span className={`task-status-label ${task.status}`}>
-                        {task.status === 'PENDING' ? 'En cola' : task.status === 'STARTED' ? 'En proceso' : task.status === 'SUCCESS' ? 'Completado' : 'Error'}
-                      </span>
-                      <span className="task-time">
-                        {task.finished_at ? timeAgo(task.finished_at) : timeAgo(task.started_at)}
-                      </span>
+          {/* ── Chat ── */}
+          {tab === 'chat' && (
+            <>
+              <div className="messages">
+                {messages.length === 0 && !loading && (
+                  <div className="empty-state">
+                    <div className="icon">
+                      <img src="/rootly.jpeg" alt="Rootly" className="empty-logo" />
                     </div>
-                    <div className="task-message">{task.message}</div>
-                    {task.result && (
-                      <div className="task-meta">
-                        <span className="task-pill">{task.result.docs} docs</span>
-                        <span className="task-pill">{task.result.datasets} datasets</span>
-                        <span className="task-pill">{task.result.jobs} jobs</span>
-                        <span className="task-pill">{task.result.source}</span>
-                      </div>
-                    )}
-                    {task.error && <div className="task-error">{task.error}</div>}
-                    <div className="task-id">{task.id}</div>
+                    <h3>Consulta tu linaje de datos</h3>
+                    <p>Pregunta sobre datasets, pipelines, impacto de cambios de schema y más.</p>
+                    <div className="suggestions">
+                      {SUGGESTIONS.map(s => (
+                        <button key={s} className="suggestion-chip" onClick={() => setInput(s)}>
+                          {s}
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                </div>
-              ))}
+                )}
+                {messages.map(msg => (
+                  <div key={msg.id} className={`message ${msg.role}`}>
+                    <span className="message-label">{msg.role === 'user' ? 'Tú' : 'Asistente'}</span>
+                    <div className="bubble">
+                      {msg.role === 'assistant'
+                        ? (
+                          <ReactMarkdown
+                            remarkPlugins={[remarkGfm]}
+                            components={{ pre: ({ children }) => <CodeBlock>{children}</CodeBlock> }}
+                          >
+                            {msg.content}
+                          </ReactMarkdown>
+                        )
+                        : msg.content}
+                    </div>
+                  </div>
+                ))}
+                {loading && (
+                  <div className="message assistant">
+                    <span className="message-label">Asistente</span>
+                    <div className="bubble">
+                      <div className="typing">
+                        <span /><span /><span />
+                        <span className="loading-hint">{LOADING_HINTS[loadingHint]}</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                <div ref={messagesEndRef} />
+              </div>
+              <div className="input-bar">
+                <textarea rows={1} value={input} onChange={e => setInput(e.target.value)}
+                  onKeyDown={handleChatKey} placeholder="¿Qué pipelines fallarían si cambio el schema de orders?"
+                  disabled={loading}
+                  style={{ minHeight: '42px', maxHeight: '120px' }}
+                  onInput={e => {
+                    const el = e.currentTarget
+                    el.style.height = 'auto'
+                    el.style.height = `${Math.min(el.scrollHeight, 120)}px`
+                  }} />
+                <button className="send-btn" onClick={sendMessage} disabled={loading || !input.trim()}>Enviar</button>
+              </div>
+            </>
+          )}
+
+          {/* ── Impacto ── */}
+          {tab === 'impact' && (
+            <div className="impact-panel">
+              <div className="impact-search">
+                <Autocomplete label="Base de datos" value={impactNamespace}
+                  onChange={v => { setImpactNamespace(v); setImpactResults(null) }}
+                  suggestions={allNamespaces} placeholder="Filtra por namespace…" disabled={impactLoading} />
+                <Autocomplete label="Tabla" value={impactTable}
+                  onChange={v => { setImpactTable(v); setImpactResults(null) }}
+                  suggestions={tableSuggestions} placeholder="Busca una tabla…" disabled={impactLoading} />
+                <button className="send-btn" onClick={runImpact} disabled={impactLoading || !impactTable.trim()}>
+                  {impactLoading ? 'Analizando…' : 'Analizar'}
+                </button>
+              </div>
+              <div className="impact-results">
+                {!impactResults && !impactLoading && (
+                  <div className="empty-state">
+                    <div className="icon">
+                      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2" opacity="0.5">
+                        <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
+                      </svg>
+                    </div>
+                    <h3>Análisis de impacto</h3>
+                    <p>Selecciona una tabla para ver qué jobs y datasets downstream se verían afectados.</p>
+                  </div>
+                )}
+                {impactResults?.length === 0 && (
+                  <p className="no-impact">Dataset no encontrado. Comprueba el nombre o ejecuta Sync.</p>
+                )}
+                {impactResults?.map((result, i) => (
+                  <div key={i} className="impact-card">
+                    <h3>
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                        <ellipse cx="12" cy="5" rx="9" ry="3" />
+                        <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
+                        <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
+                      </svg>
+                      {result.dataset}
+                    </h3>
+                    {result.layers.length === 0 && <p style={{ color: 'var(--text-muted)', fontSize: '13px' }}>Sin dependencias downstream.</p>}
+                    {result.layers.map((layer, li) => (
+                      <div key={li} className="impact-layer">
+                        <div className="impact-layer-label">Nivel {li + 1}</div>
+                        <div className="impact-nodes">
+                          {layer.map((node, ni) => (
+                            <span key={ni} className={`impact-node ${node.kind}`}>
+                              {node.kind === 'job' ? '⚙' : '◈'} {node.name}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
             </div>
-          </div>
-        )}
-      </main>
+          )}
+
+          {/* ── Grafo ── */}
+          {tab === 'graph' && (
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+              <GraphView onAskAboutNode={handleAskAboutNode} />
+            </div>
+          )}
+
+          {/* ── Tareas ── */}
+          {tab === 'tasks' && (
+            <div className="tasks-panel">
+              <div className="tasks-header">
+                <span>{tasks.length} tarea{tasks.length !== 1 ? 's' : ''} · polling cada 3s para las activas</span>
+                {tasks.length > 0 && (
+                  <button className="clear-btn" onClick={() => setTasks([])}>Limpiar todo</button>
+                )}
+              </div>
+              <div className="tasks-list">
+                {tasks.length === 0 && (
+                  <div className="empty-state">
+                    <div className="icon">
+                      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2" opacity="0.5">
+                        <path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+                      </svg>
+                    </div>
+                    <h3>Sin tareas</h3>
+                    <p>Pulsa <strong>Sync</strong> para encolar un sync y verlo aquí.</p>
+                  </div>
+                )}
+                {tasks.map(task => (
+                  <div key={task.id} className={`task-card ${task.status}`}>
+                    <div className={`task-icon ${task.status}`}>
+                      {task.status === 'SUCCESS' && (
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                          <polyline points="20 6 9 17 4 12" />
+                        </svg>
+                      )}
+                      {task.status === 'FAILURE' && (
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                          <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                        </svg>
+                      )}
+                      {(task.status === 'STARTED' || task.status === 'PENDING') && <SpinIcon />}
+                    </div>
+                    <div className="task-body">
+                      <div className="task-top">
+                        <span className={`task-status-label ${task.status}`}>
+                          {task.status === 'PENDING' ? 'En cola' : task.status === 'STARTED' ? 'En proceso' : task.status === 'SUCCESS' ? 'Completado' : 'Error'}
+                        </span>
+                        <span className="task-time">
+                          {task.finished_at ? timeAgo(task.finished_at / 1000) : timeAgo(task.started_at / 1000)}
+                        </span>
+                      </div>
+                      <div className="task-message">{task.message}</div>
+                      {task.result && (
+                        <div className="task-meta">
+                          <span className="task-pill">{task.result.docs} docs</span>
+                          <span className="task-pill">{task.result.datasets} datasets</span>
+                          <span className="task-pill">{task.result.jobs} jobs</span>
+                          <span className="task-pill">{task.result.source}</span>
+                        </div>
+                      )}
+                      {task.error && <div className="task-error">{task.error}</div>}
+                      <div className="task-id">{task.id}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </main>
+      </div>
 
       {toast && <div className={`toast ${toast.type}`}>{toast.msg}</div>}
     </>

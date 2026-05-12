@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### 2026-05-12
+- **feat: add multi-provider LLM support and session management** — Added modular LLM provider system (OpenAI, Anthropic, Bedrock) and persistent chat sessions with UI sidebar for session history management.
+
 ### 2026-05-06
 - **docs: add contributing guide and MIT license** — Added CONTRIBUTING.md with setup instructions, project layout, development workflows, and commit conventions; added MIT LICENSE.md to establish open-source governance.
 
